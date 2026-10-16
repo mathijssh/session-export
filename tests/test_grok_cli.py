@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -127,12 +128,12 @@ class GrokCliWriteTests(unittest.TestCase):
             ),
         ]
 
-    def _write(self, home: Path, *, overwrite: bool = False) -> GrokStore:
+    def _write(self, home: Path, *, overwrite: bool = False, cwd: str = r"C:\work\demo") -> GrokStore:
         from session_sdk.converters import GrokRecordBuilder
         from session_sdk.stores import destination_exists
         store = GrokStore(home)
-        records = GrokRecordBuilder().build("write-1", r"C:\work\demo", "2026-06-01T10:00:00.000Z", self._messages())
-        destination = store.destination_path("write-1", r"C:\work\demo")
+        records = GrokRecordBuilder().build("write-1", cwd, "2026-06-01T10:00:00.000Z", self._messages())
+        destination = store.destination_path("write-1", cwd)
         store.write(destination, records, overwrite=overwrite)
         self.assertTrue(destination_exists(destination))
         return store
@@ -152,14 +153,17 @@ class GrokCliWriteTests(unittest.TestCase):
 
     def test_rows_match_grok_cli_layout(self) -> None:
         with tempfile.TemporaryDirectory() as root:
+            # A real directory: the writer resolves the cwd, and a Windows-style path does not resolve on other systems.
+            cwd = Path(root) / "demo"
+            cwd.mkdir()
             home = Path(root) / ".grok"
-            self._write(home)
+            self._write(home, cwd=str(cwd))
             connection = sqlite3.connect(home / "grok.db")
             try:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
                 session = connection.execute("SELECT workspace_id, model, mode, status, cwd_at_start FROM sessions WHERE id = 'write-1'").fetchone()
-                self.assertEqual(session[1:], ("grok-4.6", "agent", "active", r"C:\work\demo"))
-                scope = r"C:\work\demo"
+                self.assertEqual(session[1:], ("grok-4.6", "agent", "active", str(cwd)))
+                scope = os.path.realpath(cwd)
                 expected_workspace = __import__("hashlib").sha1(scope.encode("utf-8")).hexdigest()[:16]
                 self.assertEqual(session[0], expected_workspace)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM messages WHERE session_id = 'write-1'").fetchone()[0], 3)
