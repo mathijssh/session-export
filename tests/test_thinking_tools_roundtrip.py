@@ -108,9 +108,8 @@ class ThinkingAndToolRoundTripTests(unittest.TestCase):
                 assistant = next(m for m in messages if m.role == "assistant")
                 self.assertEqual(assistant.thinking, THINKING)
                 self.assertEqual([call.output for call in assistant.tool_calls], ["a.txt", "permission denied"])
-                self.assertEqual([call.name for call in assistant.tool_calls], ["run_command", "read_files"] if name != "windsurf" else ["run_command", "run_command"])
-                if name not in ("windsurf",):
-                    self.assertEqual([call.arguments for call in assistant.tool_calls], [{"command": "ls"}, {"path": "b.txt"}])
+                self.assertEqual([call.name for call in assistant.tool_calls], ["run_command", "read_files"])
+                self.assertEqual([call.arguments for call in assistant.tool_calls], [{"command": "ls"}, {"path": "b.txt"}])
                 if name in ERROR_FLAGS:
                     self.assertEqual([call.is_error for call in assistant.tool_calls], [False, True])
 

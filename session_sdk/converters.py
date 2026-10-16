@@ -14,6 +14,18 @@ from session_sdk.jsonl import _loads
 from session_sdk.models import ConversionPlan, NativeSession, TextMessage, ToolCall
 from session_sdk.paths import SessionIdFactory, epoch_ms_to_iso, iso_to_epoch_ms, opencode_id, opencode_slug, stable_opencode_id, stable_session_uuid
 from session_sdk.windsurf_pb import (
+    STEP_TYPE_CHECKPOINT,
+    STEP_TYPE_FIND,
+    STEP_TYPE_GREP_SEARCH,
+    STEP_TYPE_LIST_DIRECTORY,
+    STEP_TYPE_MCP_TOOL,
+    STEP_TYPE_PLANNER_RESPONSE,
+    STEP_TYPE_RUN_COMMAND,
+    STEP_TYPE_USER_INPUT,
+    STEP_TYPE_VIEW_FILE,
+    VARIANT_CHECKPOINT,
+    VARIANT_PLANNER_RESPONSE,
+    VARIANT_USER_INPUT,
     VARIANT_COMMAND_RESULT,
     VARIANT_FIND_FILES,
     VARIANT_GREP,
@@ -3028,14 +3040,26 @@ def _encode_message_field(field_no: int, message_bytes: bytes) -> bytes:
 
 
 class WindsurfRecordBuilder:
-    """Build encrypted Windsurf Cascade .pb files from TextMessage stream.
+    """Build encrypted Windsurf Cascade .pb files from a TextMessage stream.
 
-    Serializes a CortexTrajectory protobuf with user_input and planner_response
-    steps, then encrypts with AES-256-GCM using the hardcoded Windsurf key.
+    The layout follows ``exa.cortex_pb.CortexTrajectory`` (cortex.proto in the Devin provider of pi-ai):
+
+    - a user turn is a USER_INPUT step (type 14, variant 19, text in field 2);
+    - an assistant turn is a PLANNER_RESPONSE step (type 15, variant 20) with the reply (field 1),
+      the thinking (field 3), and its tool calls (field 7);
+    - each tool call follows as its own step with the type and variant of its tool, holding the
+      call and its result. Tools without a Cascade step type are written as MCP tool steps.
+
+    The trajectory is serialized as protobuf, then encrypted with AES-256-GCM using the Windsurf key.
     """
 
     _ENCRYPTION_KEY = b"safeCodeiumworldKeYsecretBalloon"
     _NONCE_SIZE = 12
+    _SHELL = frozenset({"run_command", "bash", "exec", "shell", "terminal"})
+    _GREP = frozenset({"grep_search", "grep"})
+    _VIEW = frozenset({"view_file", "read_file", "read", "cat"})
+    _LIST = frozenset({"list_directory", "list_dir", "ls"})
+    _FIND = frozenset({"find_files", "find"})
 
     def build(self, session_id: str, cwd: str, timestamp: str, messages: list[TextMessage]) -> list[bytes]:
         from session_sdk.paths import iso_to_epoch_ms
@@ -3044,71 +3068,24 @@ class WindsurfRecordBuilder:
         except ImportError as exc:
             raise ImportError("cryptography package required for Windsurf session encryption") from exc
 
-        steps_bytes: list[bytes] = []
-        step_idx = 0
+        steps: list[bytes] = []
         for message in messages:
             if message.is_contextual:
                 continue
-            step_idx += 1
-            ts_seconds = iso_to_epoch_ms(message.timestamp) // 1000
-            metadata = _encode_message_field(5,
-                _encode_message_field(1,
-                    _encode_varint_field(1, ts_seconds)
-                )
-            )
+            metadata = _windsurf_metadata(iso_to_epoch_ms(message.timestamp) // 1000)
             if message.is_compaction:
-                cp_inner = _encode_string_field(5, message.text)
-                step = (
-                    _encode_varint_field(1, 15) +
-                    _encode_varint_field(4, 3) +
-                    metadata +
-                    _encode_message_field(30, cp_inner)
-                )
-            elif message.role == "assistant":
-                variant = b""
-                if message.text:
-                    variant += _encode_string_field(1, message.text)
-                if message.thinking:
-                    variant += _encode_string_field(3, message.thinking)
-                step = (
-                    _encode_varint_field(1, 14) +
-                    _encode_varint_field(4, 3) +
-                    metadata +
-                    _encode_message_field(20, variant)
-                )
+                steps.append(_windsurf_step(STEP_TYPE_CHECKPOINT, VARIANT_CHECKPOINT, _encode_string_field(5, message.text), metadata))
+                continue
+            if message.role == "assistant":
+                steps.append(_windsurf_step(STEP_TYPE_PLANNER_RESPONSE, VARIANT_PLANNER_RESPONSE, self._planner_variant(message), metadata))
+                for call in message.tool_calls:
+                    steps.append(self._tool_step(call, metadata))
             else:
-                variant = _encode_string_field(2, message.text)
-                step = (
-                    _encode_varint_field(1, 14) +
-                    _encode_varint_field(4, 3) +
-                    metadata +
-                    _encode_message_field(19, variant)
-                )
-            steps_bytes.append(step)
-            # Each tool call is a run_command step (type 21) after the planner step that asked for it.
-            # Its variant (field 28) holds the command (23) and, once it ran, the output (24).
-            for call in message.tool_calls:
-                # Windsurf writes every tool call as a command step. The tool name stays in the text, so a
-                # non-shell call still shows what it was.
-                if call.name == "run_command" or call.name == "":
-                    command = str(call.arguments.get("command") or json.dumps(call.arguments, ensure_ascii=False))
-                else:
-                    command = f"{call.name} {json.dumps(call.arguments, ensure_ascii=False)}"
-                run_variant = _encode_string_field(23, command)
-                if call.output is not None:
-                    run_variant += _encode_string_field(24, call.output)
-                run_variant += _encode_string_field(25, command)
-                steps_bytes.append(
-                    _encode_varint_field(1, 21) +
-                    _encode_varint_field(4, 3) +
-                    metadata +
-                    _encode_message_field(28, run_variant)
-                )
+                steps.append(_windsurf_step(STEP_TYPE_USER_INPUT, VARIANT_USER_INPUT, _encode_string_field(2, message.text), metadata))
 
-        # Build CortexTrajectory
         trajectory = _encode_string_field(1, session_id)
-        for step_b in steps_bytes:
-            trajectory += _encode_message_field(2, step_b)
+        for step in steps:
+            trajectory += _encode_message_field(2, step)
         trajectory += _encode_varint_field(4, 4)
 
         # Encrypt: [12-byte nonce][ciphertext+16-byte GCM tag]
@@ -3116,6 +3093,89 @@ class WindsurfRecordBuilder:
         nonce = _os.urandom(self._NONCE_SIZE)
         ciphertext = AESGCM(self._ENCRYPTION_KEY).encrypt(nonce, trajectory, None)
         return [nonce + ciphertext]
+
+    @staticmethod
+    def _planner_variant(message: TextMessage) -> bytes:
+        variant = b""
+        if message.text:
+            variant += _encode_string_field(1, message.text)
+        if message.thinking:
+            variant += _encode_string_field(3, message.thinking)
+        for call in message.tool_calls:
+            chat_call = (
+                _encode_string_field(1, call.id)
+                + _encode_string_field(2, call.name)
+                + _encode_string_field(3, json.dumps(call.arguments, ensure_ascii=False))
+            )
+            variant += _encode_message_field(7, chat_call)
+        return variant
+
+    def _tool_step(self, call: ToolCall, metadata: bytes) -> bytes:
+        name = call.name.lower()
+        args = call.arguments
+        output = call.output
+
+        def first(*keys: str) -> str:
+            for key in keys:
+                value = args.get(key)
+                if isinstance(value, str) and value:
+                    return value
+            return ""
+
+        if name in self._SHELL:
+            command = first("command") or json.dumps(args, ensure_ascii=False)
+            variant = _encode_string_field(23, command) + _encode_string_field(13, call.id)
+            if output is not None:
+                variant += _encode_string_field(24, output)
+            variant += _encode_string_field(25, command)
+            return _windsurf_step(STEP_TYPE_RUN_COMMAND, VARIANT_RUN_COMMAND, variant, metadata)
+        if name in self._GREP:
+            variant = _encode_string_field(1, first("query", "pattern"))
+            if first("glob", "include"):
+                variant += _encode_string_field(2, first("glob", "include"))
+            if first("path"):
+                variant += _encode_string_field(11, first("path"))
+            if output is not None:
+                variant += _encode_string_field(3, output)
+            return _windsurf_step(STEP_TYPE_GREP_SEARCH, VARIANT_GREP, variant, metadata)
+        if name in self._VIEW:
+            variant = _encode_string_field(1, first("path", "uri", "file_path", "filePath"))
+            if output is not None:
+                variant += _encode_string_field(4, output)
+            return _windsurf_step(STEP_TYPE_VIEW_FILE, VARIANT_VIEW_FILE, variant, metadata)
+        if name in self._LIST:
+            variant = _encode_string_field(1, first("path", "uri", "directory"))
+            for line in (output or "").splitlines():
+                if not line.strip():
+                    continue
+                is_dir = line.endswith("/")
+                entry = _encode_string_field(1, line.rstrip("/")) + _encode_varint_field(2, 1 if is_dir else 0)
+                variant += _encode_message_field(3, entry)
+            return _windsurf_step(STEP_TYPE_LIST_DIRECTORY, VARIANT_LIST_DIRECTORY, variant, metadata)
+        if name in self._FIND:
+            variant = _encode_string_field(1, first("pattern", "glob", "query"))
+            if output is not None:
+                variant += _encode_string_field(11, output)
+            return _windsurf_step(STEP_TYPE_FIND, VARIANT_FIND_FILES, variant, metadata)
+        # Any other tool: an MCP tool step, which keeps the tool name and its arguments.
+        chat_call = (
+            _encode_string_field(1, call.id)
+            + _encode_string_field(2, call.name)
+            + _encode_string_field(3, json.dumps(args, ensure_ascii=False))
+        )
+        variant = _encode_string_field(1, "unisessions") + _encode_message_field(2, chat_call)
+        if output is not None:
+            variant += _encode_string_field(3, output)
+        return _windsurf_step(STEP_TYPE_MCP_TOOL, VARIANT_MCP_CALL, variant, metadata)
+
+
+def _windsurf_metadata(ts_seconds: int) -> bytes:
+    return _encode_message_field(5, _encode_message_field(1, _encode_varint_field(1, ts_seconds)))
+
+
+def _windsurf_step(step_type: int, variant_field: int, variant: bytes, metadata: bytes) -> bytes:
+    """A CortexTrajectoryStep: type (1), status done (4), metadata (5), and the variant."""
+    return _encode_varint_field(1, step_type) + _encode_varint_field(4, 3) + metadata + _encode_message_field(variant_field, variant)
 
 
 class WindsurfToPiConverter:

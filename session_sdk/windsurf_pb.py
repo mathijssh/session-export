@@ -151,6 +151,17 @@ VARIANT_LIST_DIRECTORY = 15  # field 1 directory uri, 3 repeated entries (field 
 VARIANT_FIND_FILES = 34    # field 1 glob pattern, 11 matched paths
 VARIANT_MCP_CALL = 47      # field 1 server, 2 nested (1 call id, 2 tool name, 3 JSON input), 3 result
 
+# CortexStepType values from exa.cortex_pb (cortex.proto in the Devin provider of pi-ai).
+STEP_TYPE_GREP_SEARCH = 7
+STEP_TYPE_VIEW_FILE = 8
+STEP_TYPE_LIST_DIRECTORY = 9
+STEP_TYPE_CHECKPOINT = 23
+STEP_TYPE_FIND = 25
+STEP_TYPE_RUN_COMMAND = 21
+STEP_TYPE_MCP_TOOL = 38
+STEP_TYPE_USER_INPUT = 14
+STEP_TYPE_PLANNER_RESPONSE = 15
+
 
 def parse_trajectory_scope(buf: bytes) -> dict[str, str | None]:
     """Parse TrajectoryScope (field 7 of CortexTrajectory).
