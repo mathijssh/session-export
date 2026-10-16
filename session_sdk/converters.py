@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import json
+import re
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +15,12 @@ from session_sdk.jsonl import _loads
 from session_sdk.models import ConversionPlan, NativeSession, TextMessage, ToolCall
 from session_sdk.paths import SessionIdFactory, epoch_ms_to_iso, iso_to_epoch_ms, opencode_id, opencode_slug, stable_opencode_id, stable_session_uuid
 from session_sdk.windsurf_pb import (
+    VARIANT_CODE_ACTION,
+    VARIANT_ERROR_MESSAGE,
+    VARIANT_TODO_LIST,
+    iter_fields,
+    parse_step_error,
+    error_details_text,
     STEP_TYPE_CHECKPOINT,
     STEP_TYPE_FIND,
     STEP_TYPE_GREP_SEARCH,
@@ -98,7 +105,7 @@ class TokenEstimator:
 
 
 # Windsurf step variants that are tool invocations (see windsurf_pb for the layouts).
-_WINDSURF_TOOL_VARIANTS = frozenset({VARIANT_RUN_COMMAND, VARIANT_GREP, VARIANT_VIEW_FILE, VARIANT_LIST_DIRECTORY, VARIANT_FIND_FILES, VARIANT_MCP_CALL})
+_WINDSURF_TOOL_VARIANTS = frozenset({VARIANT_RUN_COMMAND, VARIANT_GREP, VARIANT_VIEW_FILE, VARIANT_LIST_DIRECTORY, VARIANT_FIND_FILES, VARIANT_MCP_CALL, VARIANT_CODE_ACTION, VARIANT_TODO_LIST})
 
 
 def _apply_options(messages: list[TextMessage]) -> list[TextMessage]:
@@ -553,6 +560,81 @@ class MessageExtractor:
         return self._with_outputs(messages, outputs)
 
     @staticmethod
+    def _first_path_in(buf: bytes, depth: int = 0) -> str:
+        """First file path found in a nested message. Cascade keeps paths in nested PathScopeItem
+        messages (``absolute_uri`` at field 5, ``absolute_path_migrate_me_to_uri`` at field 1), so this
+        looks for a ``file://`` URI or an absolute Windows or POSIX path in any string field."""
+        from session_sdk.windsurf_pb import iter_fields
+        if depth > 6:
+            return ""
+        for _fno, wtype, _off, value in iter_fields(buf):
+            if wtype != 2 or not isinstance(value, (bytes, bytearray)):
+                continue
+            try:
+                text = bytes(value).decode("utf-8")
+            except UnicodeDecodeError:
+                text = None
+            if text is not None and (text.startswith("file://") or re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith("/")):
+                return text
+            try:
+                found = MessageExtractor._first_path_in(bytes(value), depth + 1)
+            except ValueError:
+                found = ""
+            if found:
+                return found
+        return ""
+
+    @staticmethod
+    def _windsurf_code_action_call(data: bytes, index: int) -> ToolCall:
+        """CortexStepCodeAction: ``action_spec`` (1) holds an ActionSpecCommand (1) or ActionSpecCreateFile
+        (2) with the instruction. The target file is nested in it. ``code_instruction`` (8) is the fallback."""
+        from session_sdk.windsurf_pb import read_string_field
+        spec = None
+        for fno, wtype, _off, value in iter_fields(data):
+            if fno == 1 and wtype == 2 and isinstance(value, (bytes, bytearray)):
+                spec = bytes(value)
+        instruction = ""
+        path = ""
+        if spec is not None:
+            for fno, wtype, _off, value in iter_fields(spec):
+                if fno in (1, 2) and wtype == 2 and isinstance(value, (bytes, bytearray)):
+                    instruction = read_string_field(bytes(value), 1) or instruction
+            path = MessageExtractor._first_path_in(spec)
+        instruction = instruction or read_string_field(data, 8) or ""
+        return ToolCall(
+            id=f"windsurf-step-{index}",
+            name="edit_file",
+            arguments={k: v for k, v in (("path", path), ("instruction", instruction)) if v},
+            output=None,
+        )
+
+    @staticmethod
+    def _windsurf_todo_call(data: bytes, index: int) -> ToolCall:
+        """CortexStepTodoList: repeated CortexTodoListItem (1): id (1), content (2), status (3), priority (4)."""
+        from session_sdk.windsurf_pb import read_string_field
+        todos: list[JsonObject] = []
+        for fno, wtype, _off, value in iter_fields(data):
+            if fno == 1 and wtype == 2 and isinstance(value, (bytes, bytearray)):
+                status = next((v for f, w, _o, v in iter_fields(bytes(value)) if f == 3 and w == 0), None)
+                todos.append({
+                    "id": read_string_field(bytes(value), 1) or "",
+                    "content": read_string_field(bytes(value), 2) or "",
+                    "status": status if isinstance(status, int) else None,
+                })
+        return ToolCall(id=f"windsurf-step-{index}", name="todo_list", arguments={"todos": todos}, output="")
+
+    @staticmethod
+    def _attach_windsurf_error(messages: list[TextMessage], error: str) -> None:
+        """A step error belongs to the tool call that just ran. A call with no result takes it as its result."""
+        if messages and messages[-1].role == "assistant":
+            calls = list(messages[-1].tool_calls)
+            for position in range(len(calls) - 1, -1, -1):
+                if calls[position].output is None:
+                    calls[position] = replace(calls[position], output=error, is_error=True)
+                    messages[-1] = replace(messages[-1], tool_calls=tuple(calls))
+                    return
+
+    @staticmethod
     def _windsurf_tool_call(variant: int, data: object, index: int, command_outputs: dict[str, str]) -> ToolCall | None:
         """Map one Windsurf tool step to a ToolCall. ``data`` holds the step's variant bytes."""
         from session_sdk.windsurf_pb import iter_fields, read_all_string_fields, read_string_field
@@ -605,6 +687,10 @@ class MessageExtractor:
                 arguments=arguments,
                 output=read_string_field(data, 3),
             )
+        if variant == VARIANT_CODE_ACTION:
+            return MessageExtractor._windsurf_code_action_call(bytes(data), index)
+        if variant == VARIANT_TODO_LIST:
+            return MessageExtractor._windsurf_todo_call(bytes(data), index)
         return None
 
     @_shaped
@@ -654,6 +740,9 @@ class MessageExtractor:
             if not isinstance(step_buf, (bytes, bytearray)):
                 continue
             step = parse_step(step_buf)
+            step_error = parse_step_error(step_buf)
+            if step_error:
+                self._attach_windsurf_error(messages, step_error)
             vf = step["variant_field"]
             vdata = step["variant_data"]
             if vdata is None:
@@ -673,6 +762,10 @@ class MessageExtractor:
                 elif internal:
                     # Reasoning with no visible reply stays reasoning, not reply text.
                     messages.append(TextMessage("assistant", "", timestamp, provider="windsurf", thinking=internal))
+            elif vf == VARIANT_ERROR_MESSAGE:
+                details = error_details_text(bytes(vdata)) if isinstance(vdata, (bytes, bytearray)) else None
+                if details:
+                    self._attach_windsurf_error(messages, details)
             elif vf in _WINDSURF_TOOL_VARIANTS:
                 # Tool steps follow the planner turn that asked for them. The call and its result share the step.
                 call = self._windsurf_tool_call(vf, vdata, index, command_outputs)
