@@ -11,6 +11,15 @@ from session_sdk.json_types import JsonObject, as_list, as_object, as_str, seque
 from session_sdk.jsonl import _loads
 from session_sdk.models import ConversionPlan, NativeSession, TextMessage, ToolCall
 from session_sdk.paths import SessionIdFactory, epoch_ms_to_iso, iso_to_epoch_ms, opencode_id, opencode_slug, stable_opencode_id, stable_session_uuid
+from session_sdk.windsurf_pb import (
+    VARIANT_COMMAND_RESULT,
+    VARIANT_FIND_FILES,
+    VARIANT_GREP,
+    VARIANT_LIST_DIRECTORY,
+    VARIANT_MCP_CALL,
+    VARIANT_RUN_COMMAND,
+    VARIANT_VIEW_FILE,
+)
 from session_sdk.stores import (
     T3_PROVIDER_DRIVERS,
     ClaudeStore,
@@ -72,6 +81,10 @@ class TokenEstimator:
             return tiktoken.encoding_for_model("gpt-4o")
         except KeyError:
             return tiktoken.get_encoding("cl100k_base")
+
+
+# Windsurf step variants that are tool invocations (see windsurf_pb for the layouts).
+_WINDSURF_TOOL_VARIANTS = frozenset({VARIANT_RUN_COMMAND, VARIANT_GREP, VARIANT_VIEW_FILE, VARIANT_LIST_DIRECTORY, VARIANT_FIND_FILES, VARIANT_MCP_CALL})
 
 
 class MessageExtractor:
@@ -154,6 +167,10 @@ class MessageExtractor:
             if ptype == "reasoning":
                 thought = self._block_thinking(payload.get("summary"), ("summary_text",))
                 if thought:
+                    if pending_thinking and not pending_calls:
+                        # A new reasoning item with no tool call in between starts a new response.
+                        messages.append(TextMessage("assistant", "", timestamp, thinking="\n\n".join(pending_thinking)))
+                        pending_thinking = []
                     pending_thinking.append(thought)
                 continue
             if ptype in ("function_call", "custom_tool_call"):
@@ -170,12 +187,12 @@ class MessageExtractor:
             if msg.role == "assistant":
                 msg = replace(msg, thinking="\n\n".join(pending_thinking) or None, tool_calls=tuple(pending_calls))
                 pending_thinking, pending_calls = [], []
-            elif pending_calls:
-                # Tool calls answered by no assistant text (the turn ended on the tools).
+            elif pending_calls or pending_thinking:
+                # Tool calls or reasoning answered by no assistant text (the turn ended on the tools).
                 messages.append(TextMessage("assistant", "", timestamp, thinking="\n\n".join(pending_thinking) or None, tool_calls=tuple(pending_calls)))
                 pending_thinking, pending_calls = [], []
             messages.append(msg)
-        if pending_calls:
+        if pending_calls or pending_thinking:
             messages.append(TextMessage("assistant", "", session.timestamp, thinking="\n\n".join(pending_thinking) or None, tool_calls=tuple(pending_calls)))
         return self._with_outputs(messages, outputs)
 
@@ -484,6 +501,61 @@ class MessageExtractor:
                 messages.append(TextMessage("user", text, timestamp, is_contextual=True))
         return self._with_outputs(messages, outputs)
 
+    @staticmethod
+    def _windsurf_tool_call(variant: int, data: object, index: int, command_outputs: dict[str, str]) -> ToolCall | None:
+        """Map one Windsurf tool step to a ToolCall. ``data`` holds the step's variant bytes."""
+        from session_sdk.windsurf_pb import iter_fields, read_all_string_fields, read_string_field
+        if not isinstance(data, (bytes, bytearray)):
+            return None
+        call_id = f"windsurf-step-{index}"
+        if variant == VARIANT_RUN_COMMAND:
+            command_id = read_string_field(data, 13) or ""
+            output = read_string_field(data, 24)
+            if output is None and command_id:
+                output = command_outputs.get(command_id)
+            return ToolCall(
+                id=command_id or call_id,
+                name="run_command",
+                arguments={"command": read_string_field(data, 23) or ""},
+                output=output,
+            )
+        if variant == VARIANT_GREP:
+            fields = (("query", read_string_field(data, 1)), ("glob", read_string_field(data, 2)), ("path", read_string_field(data, 11)))
+            return ToolCall(id=call_id, name="grep_search", arguments={k: v for k, v in fields if v}, output=read_string_field(data, 3))
+        if variant == VARIANT_VIEW_FILE:
+            return ToolCall(id=call_id, name="view_file", arguments={"uri": read_string_field(data, 1) or ""}, output=read_string_field(data, 4))
+        if variant == VARIANT_LIST_DIRECTORY:
+            lines: list[str] = []
+            for fno, wtype, _off, entry in iter_fields(data):
+                if fno == 3 and wtype == 2 and isinstance(entry, (bytes, bytearray)):
+                    is_dir = any(f2 == 2 and w2 == 0 and v2 == 1 for f2, w2, _o2, v2 in iter_fields(entry))
+                    lines.append((read_string_field(entry, 1) or "") + ("/" if is_dir else ""))
+            return ToolCall(id=call_id, name="list_directory", arguments={"uri": read_string_field(data, 1) or ""}, output="\n".join(lines))
+        if variant == VARIANT_FIND_FILES:
+            return ToolCall(
+                id=call_id,
+                name="find_files",
+                arguments={"pattern": read_string_field(data, 1) or ""},
+                output="\n".join(read_all_string_fields(data, 11)),
+            )
+        if variant == VARIANT_MCP_CALL:
+            nested = next((v for fno, wtype, _off, v in iter_fields(data) if fno == 2 and wtype == 2 and isinstance(v, (bytes, bytearray))), None)
+            if nested is None:
+                return None
+            raw_args = read_string_field(nested, 3) or ""
+            try:
+                parsed = json.loads(raw_args) if raw_args else {}
+            except ValueError:
+                parsed = None
+            arguments = parsed if isinstance(parsed, dict) else {"raw": raw_args}
+            return ToolCall(
+                id=read_string_field(nested, 1) or call_id,
+                name=read_string_field(nested, 2) or "",
+                arguments=arguments,
+                output=read_string_field(data, 3),
+            )
+        return None
+
     def from_windsurf(self, session: NativeSession) -> list[TextMessage]:
         if not session.records:
             return []
@@ -503,10 +575,28 @@ class MessageExtractor:
             VARIANT_CHECKPOINT,
             VARIANT_CONTEXT_INJECTION,
             VARIANT_RUN_COMMAND,
+            VARIANT_COMMAND_RESULT,
+            VARIANT_GREP,
+            VARIANT_VIEW_FILE,
+            VARIANT_LIST_DIRECTORY,
+            VARIANT_FIND_FILES,
+            VARIANT_MCP_CALL,
         )
         from session_sdk.paths import epoch_ms_to_iso
         traj = parse_trajectory(plaintext)
         steps = traj.get("steps") or []
+        # A command's output can arrive in a later command-result step, joined by command id.
+        command_outputs: dict[str, str] = {}
+        for step_buf in steps:
+            if not isinstance(step_buf, (bytes, bytearray)):
+                continue
+            step = parse_step(step_buf)
+            result_data = step["variant_data"]
+            if step["variant_field"] == VARIANT_COMMAND_RESULT and isinstance(result_data, (bytes, bytearray)):
+                command_id = read_string_field(result_data, 1)
+                output = read_string_field(result_data, 9)
+                if command_id and output is not None:
+                    command_outputs[command_id] = output
         messages: list[TextMessage] = []
         for index, step_buf in enumerate(steps):
             if not isinstance(step_buf, (bytes, bytearray)):
@@ -528,20 +618,17 @@ class MessageExtractor:
                 internal = read_string_field(vdata, 3) or ""
                 if visible:
                     messages.append(TextMessage("assistant", visible, timestamp, provider="windsurf", thinking=internal or None))
-                elif internal and not visible:
-                    messages.append(TextMessage("assistant", internal, timestamp, provider="windsurf"))
-            elif vf == VARIANT_RUN_COMMAND:
-                # A terminal command follows the planner turn that asked for it. Its output is in the same step.
-                call = ToolCall(
-                    id=f"windsurf-step-{index}",
-                    name="run_command",
-                    arguments={"command": read_string_field(vdata, 23) or ""},
-                    output=read_string_field(vdata, 24),
-                )
-                if messages and messages[-1].role == "assistant":
-                    messages[-1] = replace(messages[-1], tool_calls=messages[-1].tool_calls + (call,))
-                else:
-                    messages.append(TextMessage("assistant", "", timestamp, provider="windsurf", tool_calls=(call,)))
+                elif internal:
+                    # Reasoning with no visible reply stays reasoning, not reply text.
+                    messages.append(TextMessage("assistant", "", timestamp, provider="windsurf", thinking=internal))
+            elif vf in _WINDSURF_TOOL_VARIANTS:
+                # Tool steps follow the planner turn that asked for them. The call and its result share the step.
+                call = self._windsurf_tool_call(vf, vdata, index, command_outputs)
+                if call is not None:
+                    if messages and messages[-1].role == "assistant":
+                        messages[-1] = replace(messages[-1], tool_calls=messages[-1].tool_calls + (call,))
+                    else:
+                        messages.append(TextMessage("assistant", "", timestamp, provider="windsurf", tool_calls=(call,)))
             elif vf == VARIANT_CHECKPOINT:
                 cp = parse_checkpoint(vdata)
                 summary = cp.get("session_summary") or cp.get("user_intent") or ""
@@ -1049,7 +1136,7 @@ class CodexRecordBuilder:
                     },
                 })
             content_type = "output_text" if message.role == "assistant" else "input_text"
-            if message.text or not message.tool_calls:
+            if message.text or not (message.tool_calls or message.thinking):
                 records.append(
                     {
                         "timestamp": message.timestamp,
@@ -1163,7 +1250,7 @@ class OpenCodeExportBuilder:
                         "time": {"start": created, "end": created},
                     }
                 )
-            if message.text or not message.tool_calls:
+            if message.text or not (message.tool_calls or message.thinking):
                 parts.append(
                     {
                         "id": part_id,
@@ -1442,7 +1529,7 @@ class GrokRecordBuilder:
                     "messageId": message_id,
                     "content": {"type": "text", "text": message.thinking},
                 }))
-            if message.text or not message.tool_calls:
+            if message.text or not (message.tool_calls or message.thinking):
                 records.append(envelope({
                     "sessionUpdate": role_chunk,
                     "messageId": message_id,
@@ -1551,7 +1638,7 @@ class FreebuffRecordBuilder:
             parts: list[JsonObject] = []
             if message.thinking and message.role == "assistant":
                 parts.append({"kind": "reasoning", "id": f"reasoning-{seq}", "text": message.thinking, "open": False, "collapse": "preview"})
-            if text or not message.tool_calls:
+            if text or not (message.tool_calls or message.thinking):
                 parts.append({"kind": "text", "text": text})
             for call in message.tool_calls:
                 tool: JsonObject = {
@@ -2434,7 +2521,7 @@ class FactoryRecordBuilder:
             if message.thinking and message.role == "assistant":
                 # Same block shape as Claude Code, which Factory transcripts follow.
                 content.append({"type": "thinking", "thinking": message.thinking, "signature": ""})
-            if message.text or not message.tool_calls:
+            if message.text or not (message.tool_calls or message.thinking):
                 content.append({"type": "text", "text": message.text})
             content.extend({"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments} for call in message.tool_calls)
             records.append({

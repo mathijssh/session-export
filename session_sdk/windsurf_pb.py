@@ -144,6 +144,12 @@ VARIANT_CHECKPOINT = 30
 VARIANT_FILE_CONTEXT = 15
 VARIANT_COMMAND_RESULT = 37
 VARIANT_CONTEXT_INJECTION = 38
+# Tool steps, found by decoding real trajectories. The call and its result share one step.
+VARIANT_GREP = 13          # field 1 query, 2 glob, 3 matches, 11 search path
+VARIANT_VIEW_FILE = 14     # field 1 file uri, 4 file contents
+VARIANT_LIST_DIRECTORY = 15  # field 1 directory uri, 3 repeated entries (field 1 name, field 2 1 = directory)
+VARIANT_FIND_FILES = 34    # field 1 glob pattern, 11 matched paths
+VARIANT_MCP_CALL = 47      # field 1 server, 2 nested (1 call id, 2 tool name, 3 JSON input), 3 result
 
 
 def parse_trajectory_scope(buf: bytes) -> dict[str, str | None]:
