@@ -97,6 +97,7 @@ from session_sdk.converters import (
 )
 from session_sdk.jsonl import JsonlFile
 from session_sdk.models import ConversionPlan, NativeSession, SessionSummary, TextMessage
+from session_sdk.options import ConversionOptions, conversion_options
 from session_sdk.paths import SessionIdFactory, WindowsDefaults, encode_omp_cwd, encode_pi_cwd
 from session_sdk.search import ChatSearchResult, SearchResponse, SessionSearchEngine, SessionSearchIndex, SessionSearchResult, StalePolicy
 from session_sdk.stores import T3_PROVIDER_DRIVERS, ClaudeStore, CodexStore, DevinStore, FactoryStore, FreebuffStore, GrokStore, OmpStore, OpenCodeStore, PiDcpStore, PiStore, T3Store, T3WriteError, WindsurfStore, omp_title_slot
@@ -110,6 +111,8 @@ from session_sdk.traces import (
 )
 
 __all__ = [
+    "ConversionOptions",
+    "conversion_options",
     "ChatSearchResult",
     "SearchResponse",
     "SessionSearchResult",

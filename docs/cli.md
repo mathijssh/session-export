@@ -146,6 +146,8 @@ python -m unisessions <source>-to-<target> <session-id> [flags]
 |---|---|
 | `session_id` | Positional. The source session ID to convert. |
 | `--write` | Write the converted session. Without this, only a plan is printed. |
+| `--no-thinking` | Leave reasoning out (default: carried over). Also `UNISESSIONS_NO_THINKING=1`. |
+| `--no-tool-calls` | Leave tool calls and their outputs out (default: carried over). Also `UNISESSIONS_NO_TOOL_CALLS=1`. |
 | `--overwrite` | Allow replacing an existing destination. Alias for `--on-conflict overwrite`. |
 | `--new-id` | Generate a new target session ID instead of preserving the source ID. |
 | `--on-conflict {skip,overwrite,fork,update}` | Conflict resolution mode (default: `skip`). |
@@ -202,7 +204,7 @@ When a destination file already exists, `--on-conflict` controls behavior:
 | `skip` (default) | Skip if destination exists. |
 | `overwrite` | Replace existing destination with new content. |
 | `fork` | Generate a new UUID session ID, preserve old file untouched. |
-| `update` | Check `has_changes()` -- skip if unchanged, overwrite if changed. |
+| `update` | Overwrite only when the source file was modified after the destination was written. |
 
 `--overwrite` is kept as a backward-compatible alias for `--on-conflict overwrite`.
 

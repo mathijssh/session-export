@@ -144,6 +144,23 @@ VARIANT_CHECKPOINT = 30
 VARIANT_FILE_CONTEXT = 15
 VARIANT_COMMAND_RESULT = 37
 VARIANT_CONTEXT_INJECTION = 38
+# Tool steps, found by decoding real trajectories. The call and its result share one step.
+VARIANT_GREP = 13          # field 1 query, 2 glob, 3 matches, 11 search path
+VARIANT_VIEW_FILE = 14     # field 1 file uri, 4 file contents
+VARIANT_LIST_DIRECTORY = 15  # field 1 directory uri, 3 repeated entries (field 1 name, field 2 1 = directory)
+VARIANT_FIND_FILES = 34    # field 1 glob pattern, 11 matched paths
+VARIANT_MCP_CALL = 47      # field 1 server, 2 nested (1 call id, 2 tool name, 3 JSON input), 3 result
+
+# CortexStepType values from exa.cortex_pb (cortex.proto in the Devin provider of pi-ai).
+STEP_TYPE_GREP_SEARCH = 7
+STEP_TYPE_VIEW_FILE = 8
+STEP_TYPE_LIST_DIRECTORY = 9
+STEP_TYPE_CHECKPOINT = 23
+STEP_TYPE_FIND = 25
+STEP_TYPE_RUN_COMMAND = 21
+STEP_TYPE_MCP_TOOL = 38
+STEP_TYPE_USER_INPUT = 14
+STEP_TYPE_PLANNER_RESPONSE = 15
 
 
 def parse_trajectory_scope(buf: bytes) -> dict[str, str | None]:
@@ -167,11 +184,20 @@ def parse_trajectory_scope(buf: bytes) -> dict[str, str | None]:
     return out
 
 
+# Field numbers of the CortexTrajectoryStep ``step`` oneof, from cortex.proto. Other length-delimited
+# fields of a step (error details at 31, hooks, and so on) are not variants.
+STEP_VARIANT_FIELDS = frozenset([6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 68, 70, 71, 72, 77, 83, 84, 87, 88, 94, 96, 97, 98, 99, 100, 101, 103, 104, 105, 106, 107, 108, 112, 114, 115, 116, 117, 118, 119])
+STEP_ERROR_FIELD = 31
+VARIANT_CODE_ACTION = 10
+VARIANT_ERROR_MESSAGE = 24
+VARIANT_TODO_LIST = 87
+
+
 def parse_step(step_buf: bytes) -> dict[str, int | bytes | None]:
     """Parse a CortexTrajectoryStep.
 
     Returns dict with type, status, variant_field, variant_data.
-    variant_field is the first length-delimited field >= 7 (the oneof step variant).
+    variant_field is the first length-delimited field that is a step oneof variant.
     """
     out: dict[str, int | bytes | None] = {
         "type": None,
@@ -184,11 +210,28 @@ def parse_step(step_buf: bytes) -> dict[str, int | bytes | None]:
             out["type"] = val
         elif fno == 4 and wt == 0:
             out["status"] = val
-        elif 7 <= fno <= 110 and wt == 2 and isinstance(val, (bytes, bytearray)):
+        elif fno in STEP_VARIANT_FIELDS and wt == 2 and isinstance(val, (bytes, bytearray)):
             if out["variant_field"] is None:
                 out["variant_field"] = fno
                 out["variant_data"] = val
     return out
+
+
+def error_details_text(buf: bytes) -> str | None:
+    """Text of a CortexErrorDetails message: the user-facing message, else the full or short error."""
+    for field_no in (1, 3, 2):
+        text = read_string_field(buf, field_no)
+        if text:
+            return text
+    return None
+
+
+def parse_step_error(step_buf: bytes) -> str | None:
+    """Error text of a step (field 31), if the step failed."""
+    for fno, wt, _off, val in iter_fields(step_buf):
+        if fno == STEP_ERROR_FIELD and wt == 2 and isinstance(val, (bytes, bytearray)):
+            return error_details_text(bytes(val))
+    return None
 
 
 def parse_step_timestamp(step_buf: bytes) -> int | None:

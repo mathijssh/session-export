@@ -25,6 +25,7 @@ from session_sdk.stores import (
     ClaudeStore,
     CodexStore,
     DevinStore,
+    destination_exists,
     FactoryStore,
     FreebuffStore,
     GrokStore,
@@ -272,7 +273,8 @@ class T3ConverterTests(unittest.TestCase):
         }
 
     # Targets whose has_changes cannot be decided from the destination (see converters.py).
-    ALWAYS_CHANGED = {"devin", "windsurf", "freebuff"}
+    # Grok sessions are database rows, so they cannot be compared with source line counts.
+    ALWAYS_CHANGED = {"devin", "windsurf", "freebuff", "grok"}
 
     def test_every_target_plans_writes_and_detects_changes(self) -> None:
         with tempfile.TemporaryDirectory() as root_name:
@@ -293,7 +295,7 @@ class T3ConverterTests(unittest.TestCase):
                     self.assertGreater(len(plan.records), 0)
                     self.assertTrue(converter.has_changes("chat-1"))
                     converter.write(plan, overwrite=True)
-                    self.assertTrue(plan.destination.exists())
+                    self.assertTrue(destination_exists(plan.destination))
                     if name not in self.ALWAYS_CHANGED:
                         self.assertFalse(converter.has_changes("chat-1"), "unchanged thread should not be rewritten")
                     add_v2_message(db, "chat-1", "user", "a follow-up", index=1)

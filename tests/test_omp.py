@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -41,6 +42,7 @@ from session_sdk.stores import (
     PiDcpStore,
     PiStore,
     WindsurfStore,
+    destination_exists,
     omp_title_slot,
 )
 from session_sdk.traces import build_trace
@@ -48,7 +50,8 @@ from unisessions.cli import main
 
 OMP_SESSION = "019e0000-0000-7000-8000-000000000001"
 OMP_CWD = "/work/demo-app"
-OMP_BUCKET = "--work-demo-app--"
+# omp resolves /work/demo-app against the drive on Windows (C:\work\demo-app), as it does for any cwd.
+OMP_BUCKET = "--C--work-demo-app--" if sys.platform == "win32" else "--work-demo-app--"
 
 
 def omp_entry(entry_type: str, entry_id: str, parent: str | None, **fields: object) -> dict[str, object]:
@@ -152,7 +155,7 @@ class OmpPathTests(unittest.TestCase):
         self.assertEqual(self.encode(self.temp_root / "scratch" / "x"), "-tmp-scratch-x")
         self.assertEqual(self.encode(self.temp_root), "-tmp")
         outside = self.home.parent.parent / "srv" / "app"
-        self.assertEqual(self.encode(outside), "--" + str(outside).lstrip("/").replace("/", "-") + "--")
+        self.assertEqual(self.encode(outside), "--" + re.sub(r"[/\\:]", "-", str(outside).lstrip("/\\")) + "--")
 
     def test_temp_root_inside_home_wins(self) -> None:
         nested_temp = self.home / "AppData" / "Temp"
@@ -175,7 +178,7 @@ class OmpPathTests(unittest.TestCase):
     def test_child_named_like_dotdot_is_outside_home_like_omp(self) -> None:
         # omp's containment test treats a relative path starting with ".." as outside.
         odd = self.home / "..cache"
-        self.assertEqual(self.encode(odd), "--" + str(odd).lstrip("/").replace("/", "-") + "--")
+        self.assertEqual(self.encode(odd), "--" + re.sub(r"[/\\:]", "-", str(odd).lstrip("/\\")) + "--")
 
     def test_foreign_platform_path_is_encoded_as_written(self) -> None:
         if sys.platform == "win32":
@@ -495,7 +498,7 @@ class OmpConversionTests(unittest.TestCase):
                 self.assertEqual(plan.source.provider, "omp")
                 self.assertTrue(converter.has_changes(OMP_SESSION))
                 converter.write(plan, overwrite=True)
-                self.assertTrue(plan.destination.exists())
+                self.assertTrue(destination_exists(plan.destination))
                 if name not in self.TARGETS_ALWAYS_CHANGED:
                     self.assertFalse(converter.has_changes(OMP_SESSION), "an unchanged session should not be rewritten")
         self.assertIn("omp-import", (out / "codex").rglob("*.jsonl").__next__().read_text(encoding="utf-8"))

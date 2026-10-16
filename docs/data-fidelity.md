@@ -57,7 +57,7 @@ Token estimation is per-turn, not cumulative. The builder accumulates input toke
 
 ### Tool Calls and Tool Outputs
 
-Tool calls (shell commands, function calls, web searches, image generation, custom tool calls) and their outputs are not extracted or written to the target format. The SDK's text-history extractors focus on user/assistant chat text only.
+Tool calls and their outputs are carried across formats where the target has a representation. Each tool call keeps its name, arguments, output, and error flag. The table at the end of this page lists what each format holds. Some source tools are not decoded yet (for example Windsurf's non-shell steps), so their calls are not converted. The search index still indexes chat text only.
 
 ### Approval State
 
@@ -77,7 +77,24 @@ Events that exist only in the source tool's UI layer (e.g. Pi's `thinking_level_
 
 ### Reasoning / Thinking Content
 
-Assistant reasoning or thinking blocks (where supported by the source format) are not extracted as separate messages. Only the final text output is preserved.
+Assistant reasoning is carried into the thinking field of each assistant message and written back as that format's thinking block. Codex keeps reasoning encrypted, so only the readable summary is available. T3 Code's legacy database has no field for reasoning or tool calls, so T3 writes keep text only.
+
+### Format Support
+
+| Format | Thinking (read / write) | Tool calls and outputs (read / write) |
+|---|---|---|
+| Pi | yes / yes (`thinking` block) | yes / yes (`toolCall` block, `toolResult` message) |
+| Claude Code | yes / yes (`thinking` block, unsigned) | yes / yes (`tool_use`, `tool_result`) |
+| Codex | summary only / summary only (`reasoning` item) | yes / yes (`function_call`, `function_call_output`) |
+| OpenCode | yes / yes (`reasoning` part) | yes / yes (`tool` part with state) |
+| Devin | yes / yes (`reasoning_content`) | yes / yes (`tool_calls`, `observation`) |
+| Factory | yes / yes (`thinking` block, from the Droid schema) | yes / yes (`tool_use`, `tool_result`) |
+| Windsurf | planner thinking / yes (field 3) | `run_command`, grep, view file, list directory, find files, and MCP calls, with outputs from the command-result steps / `run_command` only |
+| Grok (grok-cli `grok.db`, and Grok Build folders) | yes / yes (`reasoning` part; read from Grok Build folders too) | yes / yes (`tool-call` and `tool-result` parts, read from Grok Build ACP `tool_call` updates) |
+| Freebuff | yes / yes (`reasoning` part) | yes / yes (`tool` part) |
+| T3 Code | no / no (text only) | no / no (text only) |
+
+Claude Code removes thinking blocks before each request (checked in the Claude Code bundle), so the unsigned thinking blocks written for it are kept for display only. Behavior against the live API was not tested.
 
 ## Contextual Messages
 

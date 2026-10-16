@@ -17,6 +17,20 @@ class SessionSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolCall:
+    """A tool invocation made by an assistant message, with its recorded result if any.
+
+    Only the Pi builder writes these. Other builders keep text only.
+    """
+
+    id: str
+    name: str
+    arguments: JsonObject = field(default_factory=dict)
+    output: str | None = None
+    is_error: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class TextMessage:
     role: str
     text: str
@@ -26,6 +40,9 @@ class TextMessage:
     api: str | None = None
     is_compaction: bool = False
     is_contextual: bool = False
+    # Model reasoning, when the source keeps it (Freebuff reasoning parts). Only the Pi builder writes it.
+    thinking: str | None = None
+    tool_calls: tuple[ToolCall, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

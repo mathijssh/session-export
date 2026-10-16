@@ -1137,7 +1137,14 @@ class GrokTests(unittest.TestCase):
                 self._envelope("user_message_chunk", " there", "m1", 1776873455),
                 self._envelope("agent_message_chunk", "Hi!", "m2", 1776873456),
                 self._envelope("agent_thought_chunk", "internal reasoning", "m3", 1776873457),
-                self._envelope("tool_call", "read_file", "t1", 1776873458),
+                {
+                    "timestamp": 1776873458,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "grok-session-001",
+                        "update": {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "read_file", "rawInput": {"path": "a.txt"}},
+                    },
+                },
             ]
             JsonlFile(session_dir / "updates.jsonl").write(records, overwrite=True)
 
@@ -1150,11 +1157,14 @@ class GrokTests(unittest.TestCase):
 
             from session_sdk.converters import MessageExtractor
             messages = MessageExtractor().from_grok(session)
-            self.assertEqual(len(messages), 2)  # user (merged) + assistant; thought/tool skipped
+            # user (merged), assistant text, then the thought and tool call that started after it
+            self.assertEqual(len(messages), 3)
             self.assertEqual(messages[0].role, "user")
             self.assertEqual(messages[0].text, "Hello there")  # chunks merged
             self.assertEqual(messages[1].role, "assistant")
             self.assertEqual(messages[1].text, "Hi!")
+            self.assertEqual(messages[2].thinking, "internal reasoning")
+            self.assertEqual([call.id for call in messages[2].tool_calls], ["t1"])
 
     def test_grok_to_pi_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as root_name:
@@ -1192,8 +1202,6 @@ class GrokTests(unittest.TestCase):
             grok_home = root / ".grok"
             from session_sdk.stores import GrokStore, PiStore, PiDcpStore
             from session_sdk.converters import PiToGrokConverter, PiRecordBuilder
-            from session_sdk.paths import encode_grok_cwd_dirname
-
             pi_store = PiStore(root / ".pi" / "agent")
             dcp_store = PiDcpStore(root / ".pi-dcp")
             builder = PiRecordBuilder()
@@ -1213,7 +1221,7 @@ class GrokTests(unittest.TestCase):
             converter = PiToGrokConverter(pi_store, grok_store, SessionIdFactory(preserve_ids=True))
             plan = converter.plan("pi-src-001")
             self.assertEqual(plan.destination.name, "pi-src-001")
-            self.assertEqual(plan.destination.parent.name, encode_grok_cwd_dirname(r"C:\test\project"))
+            self.assertEqual(plan.destination.parent.name, "grok.db")  # grok-cli keeps sessions as rows
             converter.write(plan, overwrite=True)
 
             session = grok_store.load("pi-src-001")
@@ -1340,6 +1348,126 @@ class FreebuffTests(unittest.TestCase):
             self.assertEqual(messages[0].text, "Hello there")
             self.assertEqual(messages[1].role, "assistant")
             self.assertEqual(messages[1].text, "Hi back")
+
+    def test_freebuff_reasoning_becomes_pi_thinking_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as root_name:
+            root = Path(root_name)
+            db = root / "projects" / "proj-x" / "desktop-v2.db"
+            self._make_db(
+                db,
+                {"fb-thinking": {"path": r"C:	est\project", "created_at": 1776873454000}},
+                {
+                    "fb-thinking": [
+                        {"role": "user", "ts": 1776873454000, "parts": [{"kind": "text", "text": "Why?"}]},
+                        {
+                            "role": "assistant",
+                            "ts": 1776873455000,
+                            "parts": [
+                                {"kind": "reasoning", "id": "p1", "text": "First thought."},
+                                {"kind": "tool", "id": "t1", "text": "ignored"},
+                                {"kind": "reasoning", "id": "p2", "text": "Second thought."},
+                                {"kind": "text", "text": "Because of X."},
+                            ],
+                        },
+                    ]
+                },
+            )
+            from session_sdk.stores import FreebuffStore, PiStore, PiDcpStore
+            from session_sdk.converters import FreebuffToPiConverter
+            fb_store = FreebuffStore(root)
+            converter = FreebuffToPiConverter(fb_store, PiStore(root / ".pi" / "agent"), PiDcpStore(root / ".pi-dcp"), SessionIdFactory(preserve_ids=True))
+            plan = converter.plan("fb-thinking")
+            assistant = plan.records[2]["message"]
+            thinking_block = {"type": "thinking", "thinking": "First thought.\n\nSecond thought.", "thinkingSignature": "reasoning_content"}
+            self.assertEqual(assistant["content"][0], thinking_block)
+            self.assertEqual(assistant["content"][1], {"type": "text", "text": "Because of X."})
+            self.assertEqual(plan.records[1]["message"]["content"], [{"type": "text", "text": "Why?"}])
+
+    def test_freebuff_tool_calls_become_pi_tool_call_and_result_records(self) -> None:
+        with tempfile.TemporaryDirectory() as root_name:
+            root = Path(root_name)
+            db = root / "projects" / "proj-x" / "desktop-v2.db"
+            self._make_db(
+                db,
+                {"fb-tools": {"path": r"C:\test\project", "created_at": 1776873454000}},
+                {
+                    "fb-tools": [
+                        {"role": "user", "ts": 1776873454000, "parts": [{"kind": "text", "text": "List the files"}]},
+                        {
+                            "role": "assistant",
+                            "ts": 1776873455000,
+                            "parts": [
+                                {"kind": "tool", "id": "c1", "toolName": "run_terminal_command", "input": {"command": "ls"}, "output": "a.txt", "status": "success", "exitCode": 0},
+                                {"kind": "tool", "id": "c2", "toolName": "read_files", "input": {"paths": ["b.txt"]}, "output": "missing", "status": "failure"},
+                                {"kind": "tool", "id": "c3", "toolName": "glob", "input": {"pattern": "*"}, "status": "running"},
+                            ],
+                        },
+                    ]
+                },
+            )
+            from session_sdk.stores import FreebuffStore, PiStore, PiDcpStore
+            from session_sdk.converters import FreebuffToPiConverter
+            converter = FreebuffToPiConverter(FreebuffStore(root), PiStore(root / ".pi" / "agent"), PiDcpStore(root / ".pi-dcp"), SessionIdFactory(preserve_ids=True))
+            records = converter.plan("fb-tools").records
+            assistant = records[2]["message"]
+            self.assertEqual(assistant["stopReason"], "toolUse")
+            self.assertEqual(
+                assistant["content"],
+                [
+                    {"type": "toolCall", "id": "c1", "name": "run_terminal_command", "arguments": {"command": "ls"}},
+                    {"type": "toolCall", "id": "c2", "name": "read_files", "arguments": {"paths": ["b.txt"]}},
+                    {"type": "toolCall", "id": "c3", "name": "glob", "arguments": {"pattern": "*"}},
+                ],
+            )
+            results = [r["message"] for r in records[3:]]
+            self.assertEqual([r["role"] for r in results], ["toolResult"] * 3)
+            self.assertEqual([r["toolCallId"] for r in results], ["c1", "c2", "c3"])
+            self.assertEqual(results[0]["content"], [{"type": "text", "text": "a.txt"}])
+            self.assertFalse(results[0]["isError"])
+            self.assertTrue(results[1]["isError"])
+            self.assertEqual(results[2]["content"], [{"type": "text", "text": "(no output recorded)"}])
+            # Each result hangs off the previous record, so the chain stays linear.
+            self.assertEqual(records[4]["parentId"], records[3]["id"])
+
+    def test_freebuff_thinking_and_tools_become_claude_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as root_name:
+            root = Path(root_name)
+            db = root / "projects" / "proj-x" / "desktop-v2.db"
+            self._make_db(
+                db,
+                {"fb-claude": {"path": r"C:\test\project", "created_at": 1776873454000}},
+                {
+                    "fb-claude": [
+                        {"role": "user", "ts": 1776873454000, "parts": [{"kind": "text", "text": "Read the file"}]},
+                        {
+                            "role": "assistant",
+                            "ts": 1776873455000,
+                            "parts": [
+                                {"kind": "reasoning", "id": "r1", "text": "Need the file first."},
+                                {"kind": "tool", "id": "toolA1", "toolName": "read_files", "input": {"paths": ["a.txt"]}, "output": "hello", "status": "success"},
+                                {"kind": "text", "text": "It says hello."},
+                            ],
+                        },
+                    ]
+                },
+            )
+            from session_sdk.stores import FreebuffStore, ClaudeStore
+            from session_sdk.converters import FreebuffToClaudeConverter
+            converter = FreebuffToClaudeConverter(FreebuffStore(root), ClaudeStore(root / ".claude"), SessionIdFactory(preserve_ids=True))
+            records = converter.plan("fb-claude").records
+            assistant = records[1]["message"]
+            self.assertEqual(assistant["stop_reason"], "tool_use")
+            self.assertEqual(
+                assistant["content"],
+                [
+                    {"type": "thinking", "thinking": "Need the file first.", "signature": ""},
+                    {"type": "text", "text": "It says hello."},
+                    {"type": "tool_use", "id": "toolA1", "name": "read_files", "input": {"paths": ["a.txt"]}},
+                ],
+            )
+            result = records[2]
+            self.assertEqual(result["parentUuid"], records[1]["uuid"])
+            self.assertEqual(result["message"]["content"], [{"type": "tool_result", "tool_use_id": "toolA1", "content": "hello", "is_error": False}])
 
     def test_freebuff_to_pi_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as root_name:
