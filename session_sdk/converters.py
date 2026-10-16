@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
+from session_sdk.options import current_options
 from session_sdk.json_types import JsonObject, as_list, as_object, as_str, sequence_to_text, string_value
 from session_sdk.jsonl import _loads
 from session_sdk.models import ConversionPlan, NativeSession, TextMessage, ToolCall
@@ -87,6 +89,37 @@ class TokenEstimator:
 _WINDSURF_TOOL_VARIANTS = frozenset({VARIANT_RUN_COMMAND, VARIANT_GREP, VARIANT_VIEW_FILE, VARIANT_LIST_DIRECTORY, VARIANT_FIND_FILES, VARIANT_MCP_CALL})
 
 
+def _apply_options(messages: list[TextMessage]) -> list[TextMessage]:
+    """Drop thinking and tool calls that the current ConversionOptions switch off. An assistant turn
+    left with nothing (no text, thinking, or tool call) is dropped too."""
+    options = current_options()
+    if options.include_thinking and options.include_tool_calls:
+        return messages
+    shaped: list[TextMessage] = []
+    for message in messages:
+        changes: dict[str, object] = {}
+        if not options.include_thinking and message.thinking:
+            changes["thinking"] = None
+        if not options.include_tool_calls and message.tool_calls:
+            changes["tool_calls"] = ()
+        if changes:
+            message = replace(message, **changes)
+        if message.role == "assistant" and not (message.text or message.thinking or message.tool_calls):
+            continue
+        shaped.append(message)
+    return shaped
+
+
+def _shaped(extract: Callable[[MessageExtractor, NativeSession], list[TextMessage]]) -> Callable[[MessageExtractor, NativeSession], list[TextMessage]]:
+    """Apply the conversion options to an extractor's result."""
+
+    @functools.wraps(extract)
+    def wrapper(self: MessageExtractor, session: NativeSession) -> list[TextMessage]:
+        return _apply_options(extract(self, session))
+
+    return wrapper
+
+
 class MessageExtractor:
     _ROLE_MAP = {"developer": "user", "system": "user"}
 
@@ -134,6 +167,7 @@ class MessageExtractor:
         contextual = self._is_contextual(text)
         return TextMessage(mapped, text, timestamp, is_contextual=contextual)
 
+    @_shaped
     def from_codex(self, session: NativeSession) -> list[TextMessage]:
         messages: list[TextMessage] = []
         outputs: dict[str, tuple[str, bool]] = {}
@@ -215,6 +249,7 @@ class MessageExtractor:
             arguments = {}
         return ToolCall(id=str(payload.get("call_id") or ""), name=str(payload.get("name") or ""), arguments=arguments)
 
+    @_shaped
     def from_pi(self, session: NativeSession) -> list[TextMessage]:
         messages: list[TextMessage] = []
         outputs: dict[str, tuple[str, bool]] = {}
@@ -264,6 +299,7 @@ class MessageExtractor:
             )
         return self._with_outputs(messages, outputs)
 
+    @_shaped
     def from_opencode(self, session: NativeSession) -> list[TextMessage]:
         if not session.records:
             return []
@@ -327,6 +363,7 @@ class MessageExtractor:
             )
         return tuple(calls)
 
+    @_shaped
     def from_claude(self, session: NativeSession) -> list[TextMessage]:
         messages: list[TextMessage] = []
         outputs: dict[str, tuple[str, bool]] = {}
@@ -379,6 +416,7 @@ class MessageExtractor:
             messages.append(TextMessage(role, text, timestamp, model=model, thinking=thinking, tool_calls=tool_calls))
         return self._with_outputs(messages, outputs)
 
+    @_shaped
     def from_devin(self, session: NativeSession) -> list[TextMessage]:
         if not session.records:
             return []
@@ -470,6 +508,7 @@ class MessageExtractor:
                 return text
         return ""
 
+    @_shaped
     def from_factory(self, session: NativeSession) -> list[TextMessage]:
         messages: list[TextMessage] = []
         outputs: dict[str, tuple[str, bool]] = {}
@@ -556,6 +595,7 @@ class MessageExtractor:
             )
         return None
 
+    @_shaped
     def from_windsurf(self, session: NativeSession) -> list[TextMessage]:
         if not session.records:
             return []
@@ -711,6 +751,7 @@ class MessageExtractor:
             messages.append(TextMessage("assistant", text, timestamp, provider="grok", thinking=thinking, tool_calls=tuple(calls)))
         return self._with_outputs(messages, outputs)
 
+    @_shaped
     def from_grok(self, session: NativeSession) -> list[TextMessage]:
         """Extract text history from a Grok session (Grok Build or grok-cli)."""
         if any(isinstance(record, dict) and "role" in record for record in session.records):
@@ -810,6 +851,7 @@ class MessageExtractor:
             flush(key)
         return self._with_outputs(messages, outputs)
 
+    @_shaped
     def from_freebuff(self, session: NativeSession) -> list[TextMessage]:
         """Extract text history from a Freebuff Desktop session.
 
@@ -864,6 +906,7 @@ class MessageExtractor:
         extractor = extractors.get(session.provider)
         return extractor(session) if extractor is not None else []
 
+    @_shaped
     def from_t3(self, session: NativeSession) -> list[TextMessage]:
         """Extract text history from a T3 Code thread.
 
@@ -3045,7 +3088,12 @@ class WindsurfRecordBuilder:
             # Each tool call is a run_command step (type 21) after the planner step that asked for it.
             # Its variant (field 28) holds the command (23) and, once it ran, the output (24).
             for call in message.tool_calls:
-                command = str(call.arguments.get("command") or json.dumps(call.arguments, ensure_ascii=False))
+                # Windsurf writes every tool call as a command step. The tool name stays in the text, so a
+                # non-shell call still shows what it was.
+                if call.name == "run_command" or call.name == "":
+                    command = str(call.arguments.get("command") or json.dumps(call.arguments, ensure_ascii=False))
+                else:
+                    command = f"{call.name} {json.dumps(call.arguments, ensure_ascii=False)}"
                 run_variant = _encode_string_field(23, command)
                 if call.output is not None:
                     run_variant += _encode_string_field(24, call.output)

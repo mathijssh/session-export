@@ -92,6 +92,7 @@ from session_sdk.converters import (
 from session_sdk.models import ConversionPlan, SessionSummary
 from session_sdk.paths import SessionIdFactory, WindowsDefaults
 from session_sdk.stores import T3_PROVIDER_DRIVERS, T3WriteError, destination_exists, ClaudeStore, CodexStore, DevinStore, FactoryStore, FreebuffStore, GrokStore, OpenCodeStore, PiDcpStore, PiStore, T3Store, WindsurfStore
+from session_sdk.options import ConversionOptions, conversion_options
 from session_sdk.traces import TRACE_FORMATS, build_trace
 from session_sdk.converters import MessageExtractor
 
@@ -102,6 +103,20 @@ class CliApp:
 
     def run(self) -> int:
         args = self._parser().parse_args(self._argv)
+        options = self._options(args)
+        with conversion_options(options):
+            return self._run_parsed(args)
+
+    @staticmethod
+    def _options(args: argparse.Namespace) -> ConversionOptions:
+        """Everything is carried unless a switch turns it off (flag, or environment variable)."""
+        base = ConversionOptions.from_env()
+        return ConversionOptions(
+            include_thinking=base.include_thinking and not getattr(args, "no_thinking", False),
+            include_tool_calls=base.include_tool_calls and not getattr(args, "no_tool_calls", False),
+        )
+
+    def _run_parsed(self, args: argparse.Namespace) -> int:
         defaults = WindowsDefaults()
         codex = CodexStore(
             Path(args.codex_home or defaults.codex_home),
@@ -182,10 +197,10 @@ class CliApp:
             return self._single_convert(args, codex, pi, dcp, opencode, claude, devin, factory, windsurf, grok, freebuff, t3, id_factory)
 
         if args.command == "codex-to-pi-all":
-            return self._bulk_export(codex, pi, dcp, opencode, id_factory, args, targets=["pi"])
+            return self._bulk_export({"codex": codex, "pi": pi, "pi-dcp": dcp, "opencode": opencode, "claude": claude, "devin": devin, "factory": factory, "windsurf": windsurf, "grok": grok, "freebuff": freebuff}, id_factory, args, targets=["pi"])
 
         if args.command == "export-all":
-            return self._bulk_export(codex, pi, dcp, opencode, id_factory, args, targets=args.targets)
+            return self._bulk_export({"codex": codex, "pi": pi, "pi-dcp": dcp, "opencode": opencode, "claude": claude, "devin": devin, "factory": factory, "windsurf": windsurf, "grok": grok, "freebuff": freebuff}, id_factory, args, targets=args.targets)
 
         raise ValueError(f"Unsupported command: {args.command}")
 
@@ -507,6 +522,8 @@ class CliApp:
         to_trace = subparsers.add_parser("to-trace")
         to_trace.add_argument("provider", choices=("codex", "pi", "opencode", "claude", "devin", "factory", "windsurf", "grok", "freebuff", "t3"))
         to_trace.add_argument("session_id")
+        to_trace.add_argument("--no-thinking", action="store_true", help="Leave reasoning out of the output (default: carried over).")
+        to_trace.add_argument("--no-tool-calls", action="store_true", help="Leave tool calls and their outputs out of the output (default: carried over).")
         to_trace.add_argument("--format", choices=TRACE_FORMATS, default="sts",
                               help="Trace format: sts (HuggingFace), openai (fine-tuning), or sharegpt.")
         to_trace.add_argument("--output", "-o", default=None,
@@ -523,32 +540,48 @@ class CliApp:
     @staticmethod
     def _add_bulk_args(parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--write", action="store_true", help="Write converted sessions.")
+        parser.add_argument("--no-thinking", action="store_true", help="Leave reasoning out of the output (default: carried over).")
+        parser.add_argument("--no-tool-calls", action="store_true", help="Leave tool calls and their outputs out of the output (default: carried over).")
         parser.add_argument("--overwrite", action="store_true", help="Allow replacing existing destinations.")
         parser.add_argument("--new-id", action="store_true", help="Generate new target session IDs.")
         parser.add_argument("--workers", type=int, default=None, help="Number of parallel workers (default: 8).")
         parser.add_argument("--on-conflict", choices=("skip", "overwrite", "fork", "update"), default="skip",
                             help="Conflict resolution: skip, overwrite, fork (new ID), or update (overwrite if changed).")
 
+    @staticmethod
+    def _codex_converter(target: str, stores: dict[str, object], id_factory: SessionIdFactory):
+        """Converter from Codex to one export target. Every target is supported, as in the single commands."""
+        codex = stores["codex"]
+        if target == "pi":
+            return CodexToPiConverter(codex, stores["pi"], stores["pi-dcp"], id_factory)  # type: ignore[arg-type]
+        builders = {
+            "opencode": CodexToOpenCodeConverter,
+            "claude": CodexToClaudeConverter,
+            "devin": CodexToDevinConverter,
+            "factory": CodexToFactoryConverter,
+            "windsurf": CodexToWindsurfConverter,
+            "grok": CodexToGrokConverter,
+            "freebuff": CodexToFreebuffConverter,
+        }
+        return builders[target](codex, stores[target], id_factory)  # type: ignore[call-arg, arg-type]
+
     def _bulk_export(
         self,
-        codex: CodexStore,
-        pi: PiStore,
-        dcp: PiDcpStore,
-        opencode: OpenCodeStore,
+        stores: dict[str, object],
         id_factory: SessionIdFactory,
         args: argparse.Namespace,
         targets: list[str],
     ) -> int:
         workers = args.workers or 8
-        summaries = codex.list(workers=1)
+        codex = stores["codex"]
+        summaries = codex.list(workers=1)  # type: ignore[attr-defined]
         total = len(summaries)
         print(f"Found {total} Codex sessions. Workers: {workers}. Targets: {', '.join(targets)}")
         if not args.write:
             print("Dry run -- use --write to export.")
             return 0
 
-        pi_converter = CodexToPiConverter(codex, pi, dcp, id_factory)
-        opencode_converter = CodexToOpenCodeConverter(codex, opencode, id_factory)
+        converters = {target: self._codex_converter(target, stores, id_factory) for target in targets}
 
         exported = 0
         skipped = 0
@@ -559,52 +592,17 @@ class CliApp:
             try:
                 results = []
                 for target in targets:
-                    if target == "pi":
-                        converter = pi_converter
-                        if args.on_conflict == "update":
-                            try:
-                                if not converter.has_changes(sid):
-                                    results.append("pi:skipped")
-                                    continue
-                            except Exception:
-                                pass
-                        plan = converter.plan(sid)
-                        if plan.destination.exists():
-                            action = self._resolve_conflict(args, converter, sid)
-                            if action == "skip":
-                                results.append("pi:skipped")
-                                continue
-                            elif action == "fork":
-                                new_id = str(uuid4())
-                                plan = converter.plan(sid, target_id=new_id)
-                        try:
-                            converter.write(plan, overwrite=True)
-                        except FileExistsError:
-                            converter.write(plan, overwrite=True)
-                        results.append("pi:ok")
-                    elif target == "opencode":
-                        converter = opencode_converter
-                        if args.on_conflict == "update":
-                            try:
-                                if not converter.has_changes(sid):
-                                    results.append("opencode:skipped")
-                                    continue
-                            except Exception:
-                                pass
-                        plan = converter.plan(sid)
-                        if plan.destination.exists():
-                            action = self._resolve_conflict(args, converter, sid)
-                            if action == "skip":
-                                results.append("opencode:skipped")
-                                continue
-                            elif action == "fork":
-                                new_id = str(uuid4())
-                                plan = converter.plan(sid, target_id=new_id)
-                        try:
-                            converter.write(plan, overwrite=True)
-                        except FileExistsError:
-                            converter.write(plan, overwrite=True)
-                        results.append("opencode:ok")
+                    converter = converters[target]
+                    plan = converter.plan(sid)
+                    if self._destination_taken(converter, plan):
+                        action = self._resolve_conflict(args, plan)
+                        if action == "skip":
+                            results.append(f"{target}:skipped")
+                            continue
+                        if action == "fork":
+                            plan = converter.plan(sid, target_id=str(uuid4()))
+                    converter.write(plan, overwrite=True)
+                    results.append(f"{target}:ok")
                 return sid, ",".join(results), ""
             except Exception as exc:
                 return sid, "failed", str(exc)
@@ -639,6 +637,8 @@ class CliApp:
     def _add_convert_args(parser: argparse.ArgumentParser) -> None:
         parser.add_argument("session_id")
         parser.add_argument("--write", action="store_true", help="Write the converted session.")
+        parser.add_argument("--no-thinking", action="store_true", help="Leave reasoning out of the output (default: carried over).")
+        parser.add_argument("--no-tool-calls", action="store_true", help="Leave tool calls and their outputs out of the output (default: carried over).")
         parser.add_argument("--overwrite", action="store_true", help="Allow replacing an existing destination.")
         parser.add_argument("--new-id", action="store_true", help="Generate a new target session ID.")
         parser.add_argument("--on-conflict", choices=("skip", "overwrite", "fork", "update"), default="skip",
@@ -762,16 +762,6 @@ class CliApp:
                 if args.write:
                     return 2
 
-        # For update mode, check changes before planning to avoid double parse.
-        # has_changes only counts source records vs destination records -- fast.
-        if args.write and args.on_conflict == "update":
-            try:
-                if not converter.has_changes(sid):
-                    print(f"No changes detected, skipping.")
-                    return 0
-            except Exception:
-                pass  # If check fails, proceed to plan
-
         target_id: str | None = None
         if args.write and args.on_conflict == "fork":
             # Check if destination exists before forking
@@ -788,7 +778,7 @@ class CliApp:
         self._print_plan(plan)
         if args.write:
             if self._destination_taken(converter, plan):
-                action = self._resolve_conflict(args, converter, sid)
+                action = self._resolve_conflict(args, plan)
                 if action == "skip":
                     print(f"Destination exists, skipping: {plan.destination}")
                     return 0
@@ -853,7 +843,7 @@ class CliApp:
             return bool(taken(plan))
         return destination_exists(plan.destination)
 
-    def _resolve_conflict(self, args: argparse.Namespace, converter, session_id: str) -> str:
+    def _resolve_conflict(self, args: argparse.Namespace, plan: ConversionPlan) -> str:
         """Returns 'skip', 'overwrite', or 'fork'."""
         if args.overwrite:
             return "overwrite"
@@ -863,13 +853,27 @@ class CliApp:
         if mode == "fork":
             return "fork"
         if mode == "update":
-            try:
-                if converter.has_changes(session_id):
-                    return "overwrite"
-                return "skip"
-            except Exception:
-                return "skip"
+            return "overwrite" if self._source_changed(plan) else "skip"
         return "skip"
+
+    @classmethod
+    def _source_changed(cls, plan: ConversionPlan) -> bool:
+        """``update`` rewrites a session only when its source was modified after the destination was written.
+        Both times come from the file system. A session inside a database uses the database file's time."""
+        source = cls._mtime_ns(plan.source.path)
+        destination = cls._mtime_ns(plan.destination)
+        if source is None or destination is None:
+            return True
+        return source > destination
+
+    @staticmethod
+    def _mtime_ns(path: Path) -> int | None:
+        for candidate in (path, path.parent):
+            try:
+                return candidate.stat().st_mtime_ns
+            except OSError:
+                continue
+        return None
 
     @staticmethod
     def _print_summaries(summaries: list[SessionSummary]) -> None:
