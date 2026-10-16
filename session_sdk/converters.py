@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Protocol
@@ -8,7 +9,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from session_sdk.json_types import JsonObject, as_list, as_object, as_str, sequence_to_text, string_value
 from session_sdk.jsonl import _loads
-from session_sdk.models import ConversionPlan, NativeSession, TextMessage
+from session_sdk.models import ConversionPlan, NativeSession, TextMessage, ToolCall
 from session_sdk.paths import SessionIdFactory, epoch_ms_to_iso, iso_to_epoch_ms, opencode_id, opencode_slug, stable_opencode_id, stable_session_uuid
 from session_sdk.stores import (
     T3_PROVIDER_DRIVERS,
@@ -122,6 +123,9 @@ class MessageExtractor:
 
     def from_codex(self, session: NativeSession) -> list[TextMessage]:
         messages: list[TextMessage] = []
+        outputs: dict[str, tuple[str, bool]] = {}
+        pending_thinking: list[str] = []
+        pending_calls: list[ToolCall] = []
         for record in session.records:
             rtype = record.get("type")
             if rtype == "compacted":
@@ -143,16 +147,60 @@ class MessageExtractor:
                             messages.append(msg)
                 continue
             payload = as_object(record.get("payload"))
-            if payload is None or payload.get("type") != "message":
+            if payload is None:
                 continue
+            ptype = payload.get("type")
             timestamp = string_value(record, "timestamp") or session.timestamp
+            if ptype == "reasoning":
+                thought = self._block_thinking(payload.get("summary"), ("summary_text",))
+                if thought:
+                    pending_thinking.append(thought)
+                continue
+            if ptype in ("function_call", "custom_tool_call"):
+                pending_calls.append(self._codex_call(payload, ptype))
+                continue
+            if ptype in ("function_call_output", "custom_tool_call_output"):
+                outputs[string_value(payload, "call_id") or ""] = (self._result_text(payload.get("output")), False)
+                continue
+            if ptype != "message":
+                continue
             msg = self._extract_codex_message(payload, timestamp)
-            if msg:
-                messages.append(msg)
-        return messages
+            if msg is None:
+                continue
+            if msg.role == "assistant":
+                msg = replace(msg, thinking="\n\n".join(pending_thinking) or None, tool_calls=tuple(pending_calls))
+                pending_thinking, pending_calls = [], []
+            elif pending_calls:
+                # Tool calls answered by no assistant text (the turn ended on the tools).
+                messages.append(TextMessage("assistant", "", timestamp, thinking="\n\n".join(pending_thinking) or None, tool_calls=tuple(pending_calls)))
+                pending_thinking, pending_calls = [], []
+            messages.append(msg)
+        if pending_calls:
+            messages.append(TextMessage("assistant", "", session.timestamp, thinking="\n\n".join(pending_thinking) or None, tool_calls=tuple(pending_calls)))
+        return self._with_outputs(messages, outputs)
+
+    @staticmethod
+    def _codex_call(payload: JsonObject, kind: str) -> ToolCall:
+        """``function_call`` keeps its arguments as a JSON string. ``custom_tool_call`` keeps raw input text."""
+        raw = payload.get("arguments") if kind == "function_call" else payload.get("input")
+        arguments: JsonObject
+        if isinstance(raw, dict):
+            arguments = raw
+        elif kind == "function_call" and isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                parsed = None
+            arguments = parsed if isinstance(parsed, dict) else {"raw": raw}
+        elif raw is not None:
+            arguments = {"input": raw}
+        else:
+            arguments = {}
+        return ToolCall(id=str(payload.get("call_id") or ""), name=str(payload.get("name") or ""), arguments=arguments)
 
     def from_pi(self, session: NativeSession) -> list[TextMessage]:
         messages: list[TextMessage] = []
+        outputs: dict[str, tuple[str, bool]] = {}
         current_provider: str | None = None
         current_model: str | None = None
         for record in session.records:
@@ -173,10 +221,15 @@ class MessageExtractor:
             if message is None:
                 continue
             role = string_value(message, "role")
+            content = message.get("content")
+            if role == "toolResult":
+                outputs[string_value(message, "toolCallId") or ""] = (self._result_text(content), bool(message.get("isError")))
+                continue
             if role not in {"user", "assistant", "system"}:
                 continue
-            text = self._content_text(message.get("content"))
-            if not text:
+            text = self._content_text(content)
+            tool_calls = self._block_tool_calls(content, ("toolCall",))
+            if not text and not tool_calls:
                 continue
             timestamp = string_value(record, "timestamp") or string_value(message, "timestamp") or session.timestamp
             mapped_role = self._ROLE_MAP.get(role, role)
@@ -188,9 +241,11 @@ class MessageExtractor:
                     model=string_value(message, "model") or current_model,
                     provider=string_value(message, "provider") or current_provider,
                     api=string_value(message, "api"),
+                    thinking=self._block_thinking(content),
+                    tool_calls=tool_calls,
                 )
             )
-        return messages
+        return self._with_outputs(messages, outputs)
 
     def from_opencode(self, session: NativeSession) -> list[TextMessage]:
         if not session.records:
@@ -214,7 +269,8 @@ class MessageExtractor:
             if info.get("summary") is True and role == "assistant" and text:
                 extracted.append(TextMessage("user", text, timestamp, is_compaction=True))
                 continue
-            if not text:
+            tool_calls = self._opencode_tool_calls(parts)
+            if not text and not tool_calls:
                 continue
             extracted.append(
                 TextMessage(
@@ -223,12 +279,41 @@ class MessageExtractor:
                     timestamp,
                     model=string_value(info, "modelID") or self._nested_model_value(info, "modelID"),
                     provider=string_value(info, "providerID") or self._nested_model_value(info, "providerID"),
+                    thinking=self._block_thinking(parts, ("reasoning",)),
+                    tool_calls=tool_calls,
                 )
             )
         return extracted
 
+    @staticmethod
+    def _opencode_tool_calls(parts: list[object]) -> tuple[ToolCall, ...]:
+        """OpenCode ``tool`` parts: ``callID``, ``tool``, and ``state`` with input, output and status."""
+        calls: list[ToolCall] = []
+        for part in parts:
+            obj = as_object(part)
+            if obj is None or obj.get("type") != "tool":
+                continue
+            state = as_object(obj.get("state")) or {}
+            output = state.get("output")
+            arguments = as_object(state.get("input")) or {}
+            is_error = state.get("status") == "error"
+            if is_error and output is None:
+                output = state.get("error")
+            calls.append(
+                ToolCall(
+                    id=str(obj.get("callID") or ""),
+                    name=str(obj.get("tool") or ""),
+                    arguments=arguments,
+                    output=output if isinstance(output, str) else None,
+                    is_error=is_error,
+                )
+            )
+        return tuple(calls)
+
     def from_claude(self, session: NativeSession) -> list[TextMessage]:
         messages: list[TextMessage] = []
+        outputs: dict[str, tuple[str, bool]] = {}
+        last_message_id: str | None = None
         for record in session.records:
             rtype = record.get("type")
             if rtype == "system" and record.get("subtype") == "compact_boundary":
@@ -245,16 +330,37 @@ class MessageExtractor:
             role = string_value(message, "role") or rtype
             if role not in ("user", "assistant"):
                 continue
-            text = self._content_text(message.get("content"))
-            if not text:
+            content = message.get("content")
+            for block in as_list(content) or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    outputs[str(block.get("tool_use_id") or "")] = (self._result_text(block.get("content")), block.get("is_error") is True)
+            text = self._content_text(content)
+            thinking = self._block_thinking(content)
+            tool_calls = self._block_tool_calls(content)
+            if not text and not tool_calls and not thinking:
+                continue
+            if role == "user" and not text:
                 continue
             timestamp = string_value(record, "timestamp") or session.timestamp
             model = string_value(message, "model")
             if record.get("isCompactSummary") is True:
                 messages.append(TextMessage("user", text, timestamp, is_compaction=True))
                 continue
-            messages.append(TextMessage(role, text, timestamp, model=model))
-        return messages
+            # Claude Code writes one JSONL line per content block, and they share message.id.
+            # Lines of the same assistant turn are merged back into one message.
+            message_id = string_value(message, "id")
+            if role == "assistant" and message_id and message_id == last_message_id and messages and messages[-1].role == "assistant":
+                previous = messages[-1]
+                messages[-1] = replace(
+                    previous,
+                    text="\n\n".join(part for part in (previous.text, text) if part),
+                    thinking="\n\n".join(part for part in (previous.thinking, thinking) if part) or None,
+                    tool_calls=previous.tool_calls + tool_calls,
+                )
+                continue
+            last_message_id = message_id if role == "assistant" else None
+            messages.append(TextMessage(role, text, timestamp, model=model, thinking=thinking, tool_calls=tool_calls))
+        return self._with_outputs(messages, outputs)
 
     def from_devin(self, session: NativeSession) -> list[TextMessage]:
         if not session.records:
@@ -284,12 +390,40 @@ class MessageExtractor:
                 messages.append(TextMessage("user", text, timestamp))
             elif source == "agent":
                 text = self._devin_message_text(message)
-                if not text:
+                tool_calls = self._devin_tool_calls(step_obj)
+                thinking = string_value(step_obj, "reasoning_content") or None
+                if not text and not tool_calls:
                     continue
                 extra = as_object(step_obj.get("extra")) or {}
                 gen_model = string_value(extra, "generation_model") or model_name
-                messages.append(TextMessage("assistant", text, timestamp, model=gen_model, provider="devin"))
-        return messages
+                messages.append(TextMessage("assistant", text, timestamp, model=gen_model, provider="devin", thinking=thinking, tool_calls=tool_calls))
+        return self._with_outputs(messages, self._devin_outputs(steps))
+
+    @staticmethod
+    def _devin_tool_calls(step: JsonObject) -> tuple[ToolCall, ...]:
+        """ATIF ``tool_calls`` on an agent step: ``tool_call_id``, ``function_name``, ``arguments``."""
+        calls: list[ToolCall] = []
+        for call in as_list(step.get("tool_calls")) or []:
+            obj = as_object(call)
+            if obj is None:
+                continue
+            arguments = as_object(obj.get("arguments")) or {}
+            calls.append(ToolCall(id=str(obj.get("tool_call_id") or ""), name=str(obj.get("function_name") or ""), arguments=arguments))
+        return tuple(calls)
+
+    @classmethod
+    def _devin_outputs(cls, steps: list[object]) -> dict[str, tuple[str, bool]]:
+        """Observations hold results keyed by ``source_call_id``. Devin reports no error flag."""
+        outputs: dict[str, tuple[str, bool]] = {}
+        for step in steps:
+            step_obj = as_object(step)
+            observation = as_object((step_obj or {}).get("observation")) or {}
+            for result in as_list(observation.get("results")) or []:
+                obj = as_object(result)
+                if obj is None:
+                    continue
+                outputs[str(obj.get("source_call_id") or "")] = (cls._result_text(obj.get("content")), False)
+        return outputs
 
     _DEVIN_CONTEXTUAL_MARKERS: tuple[str, ...] = (
         "You are Devin, an interactive command line agent",
@@ -321,6 +455,7 @@ class MessageExtractor:
 
     def from_factory(self, session: NativeSession) -> list[TextMessage]:
         messages: list[TextMessage] = []
+        outputs: dict[str, tuple[str, bool]] = {}
         for record in session.records:
             rtype = record.get("type")
             if rtype != "message":
@@ -331,17 +466,23 @@ class MessageExtractor:
             role = string_value(msg, "role") or "user"
             timestamp = string_value(record, "timestamp") or session.timestamp
             content = msg.get("content")
+            for block in as_list(content) or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    outputs[str(block.get("tool_use_id") or "")] = (self._result_text(block.get("content")), block.get("is_error") is True)
             text = sequence_to_text(content) if isinstance(content, list) else (string_value(msg, "content") or "")
-            if not text:
+            tool_calls = self._block_tool_calls(content) if role == "assistant" else ()
+            if not text and not tool_calls:
                 continue
             if role == "user":
                 contextual = self._is_contextual(text)
                 messages.append(TextMessage("user", text, timestamp, is_contextual=contextual))
             elif role == "assistant":
-                messages.append(TextMessage("assistant", text, timestamp, provider="factory"))
+                messages.append(
+                    TextMessage("assistant", text, timestamp, provider="factory", thinking=self._block_thinking(content), tool_calls=tool_calls)
+                )
             elif role == "system":
                 messages.append(TextMessage("user", text, timestamp, is_contextual=True))
-        return messages
+        return self._with_outputs(messages, outputs)
 
     def from_windsurf(self, session: NativeSession) -> list[TextMessage]:
         if not session.records:
@@ -361,12 +502,13 @@ class MessageExtractor:
             VARIANT_PLANNER_RESPONSE,
             VARIANT_CHECKPOINT,
             VARIANT_CONTEXT_INJECTION,
+            VARIANT_RUN_COMMAND,
         )
         from session_sdk.paths import epoch_ms_to_iso
         traj = parse_trajectory(plaintext)
         steps = traj.get("steps") or []
         messages: list[TextMessage] = []
-        for step_buf in steps:
+        for index, step_buf in enumerate(steps):
             if not isinstance(step_buf, (bytes, bytearray)):
                 continue
             step = parse_step(step_buf)
@@ -385,9 +527,21 @@ class MessageExtractor:
                 visible = read_string_field(vdata, 1) or ""
                 internal = read_string_field(vdata, 3) or ""
                 if visible:
-                    messages.append(TextMessage("assistant", visible, timestamp, provider="windsurf"))
+                    messages.append(TextMessage("assistant", visible, timestamp, provider="windsurf", thinking=internal or None))
                 elif internal and not visible:
                     messages.append(TextMessage("assistant", internal, timestamp, provider="windsurf"))
+            elif vf == VARIANT_RUN_COMMAND:
+                # A terminal command follows the planner turn that asked for it. Its output is in the same step.
+                call = ToolCall(
+                    id=f"windsurf-step-{index}",
+                    name="run_command",
+                    arguments={"command": read_string_field(vdata, 23) or ""},
+                    output=read_string_field(vdata, 24),
+                )
+                if messages and messages[-1].role == "assistant":
+                    messages[-1] = replace(messages[-1], tool_calls=messages[-1].tool_calls + (call,))
+                else:
+                    messages.append(TextMessage("assistant", "", timestamp, provider="windsurf", tool_calls=(call,)))
             elif vf == VARIANT_CHECKPOINT:
                 cp = parse_checkpoint(vdata)
                 summary = cp.get("session_summary") or cp.get("user_intent") or ""
@@ -409,34 +563,38 @@ class MessageExtractor:
     def from_grok(self, session: NativeSession) -> list[TextMessage]:
         """Extract text history from a Grok Build session.
 
-        Grok stores sessions as ``updates.jsonl``: one ACP session update
-        envelope per line with shape
+        Grok stores sessions as ``updates.jsonl``: one ACP session update envelope per line,
         ``{"timestamp", "method", "params": {"sessionId", "update"}}``.
-        ``user_message_chunk`` / ``agent_message_chunk`` update events carry
-        ``ContentChunk`` payloads with ``content: {type: "text", text}`` and
-        a ``messageId`` used to group streamed chunks into one message.
-        ``agent_thought_chunk`` (internal reasoning) is skipped, as are
-        tool_call / tool_call_update events, matching the text-history
-        contract used by every other provider.
+
+        ``user_message_chunk`` and ``agent_message_chunk`` carry text, and ``messageId`` groups the
+        streamed chunks of one message. ``agent_thought_chunk`` is the model's reasoning for the same
+        ``messageId``. ``tool_call`` starts a tool invocation (``toolCallId``, ``title``, ``rawInput``),
+        and ``tool_call_update`` reports its result (``rawOutput`` or content text, and a ``failed``
+        status for errors). A tool call joins the agent message that was streaming when it started.
         """
         messages: list[TextMessage] = []
-        # Pending streamed chunk aggregation keyed by messageId.
+        outputs: dict[str, tuple[str, bool]] = {}
         pending: dict[str, dict[str, object]] = {}
+        current_agent: str | None = None
+        anonymous = 0
 
-        def flush(message_id: str) -> None:
-            item = pending.pop(message_id, None)
+        def entry(key: str, role: str, timestamp: str) -> dict[str, object]:
+            return pending.setdefault(key, {"role": role, "text": "", "thinking": "", "timestamp": timestamp, "calls": []})
+
+        def flush(key: str) -> None:
+            item = pending.pop(key, None)
             if item is None:
                 return
-            text = str(item.get("text") or "")
-            if not text:
+            text = str(item["text"])
+            thinking = str(item["thinking"]) or None
+            calls = tuple(item["calls"])  # type: ignore[arg-type]
+            if not text and not thinking and not calls:
                 return
-            role = str(item.get("role") or "user")
-            timestamp = str(item.get("timestamp") or session.timestamp)
-            contextual = self._is_contextual(text)
-            if role == "assistant":
-                messages.append(TextMessage("assistant", text, timestamp, provider="grok"))
+            timestamp = str(item["timestamp"])
+            if item["role"] == "assistant":
+                messages.append(TextMessage("assistant", text, timestamp, provider="grok", thinking=thinking, tool_calls=calls))
             else:
-                messages.append(TextMessage("user", text, timestamp, is_contextual=contextual))
+                messages.append(TextMessage("user", text, timestamp, is_contextual=self._is_contextual(text)))
 
         for record in session.records:
             if not isinstance(record, dict):
@@ -447,37 +605,53 @@ class MessageExtractor:
             params = as_object(record.get("params")) or {}
             update = as_object(params.get("update")) or {}
             utype = string_value(update, "sessionUpdate") or ""
+            timestamp = str(record.get("timestamp") or "") or session.timestamp
+
+            if utype == "tool_call":
+                call_id = string_value(update, "toolCallId") or ""
+                call = ToolCall(
+                    id=call_id,
+                    name=string_value(update, "title") or string_value(update, "kind") or "",
+                    arguments=as_object(update.get("rawInput")) or {},
+                )
+                key = current_agent or f"tool-{call_id}"
+                entry(key, "assistant", timestamp)["calls"].append(call)  # type: ignore[union-attr]
+                continue
+            if utype == "tool_call_update":
+                status = string_value(update, "status") or ""
+                if status not in ("completed", "failed"):
+                    continue
+                call_id = string_value(update, "toolCallId") or ""
+                raw = update.get("rawOutput")
+                nested = [as_object(block.get("content")) or {} for block in as_list(update.get("content")) or [] if isinstance(block, dict)]
+                text = self._result_text(raw) if raw is not None else "\n".join(str(part.get("text") or "") for part in nested if part.get("text"))
+                outputs[call_id] = (text, status == "failed")
+                continue
+
             if utype not in ("user_message_chunk", "agent_message_chunk", "agent_thought_chunk"):
-                # tool_call, tool_call_update, plan, session_info_update,
-                # usage_update, etc. are not text history.
+                # plan, session_info_update, usage_update, etc. are not part of the history.
+                continue
+            content = as_object(update.get("content")) or {}
+            if string_value(content, "type") != "text":
+                continue
+            text = string_value(content, "text") or ""
+            if not text:
                 continue
             message_id = string_value(update, "messageId") or ""
-            content = as_object(update.get("content")) or {}
-            ctype = string_value(content, "type") or ""
-            text = string_value(content, "text") or ""
-            if not text or ctype != "text":
-                continue
-            if utype == "agent_thought_chunk":
-                continue
-            role = "assistant" if utype == "agent_message_chunk" else "user"
-            timestamp = str(record.get("timestamp") or "") or session.timestamp
             if not message_id:
-                # No message id: emit directly.
-                contextual = self._is_contextual(text)
-                if role == "assistant":
-                    messages.append(TextMessage("assistant", text, timestamp, provider="grok"))
-                else:
-                    messages.append(TextMessage("user", text, timestamp, is_contextual=contextual))
+                anonymous += 1
+                message_id = f"anonymous-{anonymous}"
+            if utype == "user_message_chunk":
+                entry(message_id, "user", timestamp)["text"] = str(entry(message_id, "user", timestamp)["text"]) + text
                 continue
-            if message_id in pending:
-                # Same message continues streaming: append the chunk text.
-                pending[message_id]["text"] = str(pending[message_id].get("text") or "") + text
-                continue
-            pending[message_id] = {"role": role, "text": text, "timestamp": timestamp}
-        # Flush remaining pending chunks in insertion order.
-        for message_id in list(pending.keys()):
-            flush(message_id)
-        return messages
+            current_agent = message_id
+            item = entry(message_id, "assistant", timestamp)
+            field = "thinking" if utype == "agent_thought_chunk" else "text"
+            item[field] = str(item[field]) + text
+
+        for key in list(pending.keys()):
+            flush(key)
+        return self._with_outputs(messages, outputs)
 
     def from_freebuff(self, session: NativeSession) -> list[TextMessage]:
         """Extract text history from a Freebuff Desktop session.
@@ -501,12 +675,16 @@ class MessageExtractor:
                 continue
             text_parts = [p for p in parts if isinstance(p, dict) and p.get("kind") == "text"]
             text = "\n\n".join(str(p.get("text") or "") for p in text_parts if p.get("text"))
-            if not text:
+            tool_calls = self._freebuff_tool_calls(parts) if role == "assistant" else ()
+            if not text and not tool_calls:
                 continue
             ts = record.get("ts")
             timestamp = epoch_ms_to_iso(int(ts)) if isinstance(ts, (int, float)) and ts else session.timestamp
             if role == "assistant":
-                messages.append(TextMessage("assistant", text, timestamp, provider="freebuff"))
+                # Reasoning parts are separate thoughts (each has its own id), so they are joined, not merged.
+                reasoning_parts = [p for p in parts if isinstance(p, dict) and p.get("kind") == "reasoning"]
+                thinking = "\n\n".join(str(p.get("text") or "") for p in reasoning_parts if p.get("text")) or None
+                messages.append(TextMessage("assistant", text, timestamp, provider="freebuff", thinking=thinking, tool_calls=tool_calls))
             else:
                 contextual = self._is_contextual(text)
                 messages.append(TextMessage("user", text, timestamp, is_contextual=contextual))
@@ -551,6 +729,28 @@ class MessageExtractor:
                 messages.append(TextMessage("user", text, timestamp, is_contextual=self._is_contextual(text)))
         return messages
 
+    @staticmethod
+    def _freebuff_tool_calls(parts: list[object]) -> tuple[ToolCall, ...]:
+        """Freebuff ``tool`` parts: ``toolName``, ``input`` (object), ``output`` (text, may be missing),
+        and ``status`` (success, failure, running, or missing). A failure is a failed status or a
+        non-zero ``exitCode``."""
+        calls: list[ToolCall] = []
+        for part in parts:
+            if not isinstance(part, dict) or part.get("kind") != "tool":
+                continue
+            output = part.get("output")
+            exit_code = part.get("exitCode")
+            calls.append(
+                ToolCall(
+                    id=str(part.get("id") or ""),
+                    name=str(part.get("toolName") or ""),
+                    arguments=part.get("input") if isinstance(part.get("input"), dict) else {},
+                    output=output if isinstance(output, str) else None,
+                    is_error=part.get("status") == "failure" or (isinstance(exit_code, int) and exit_code != 0),
+                )
+            )
+        return tuple(calls)
+
     _WINDSURF_CONTEXTUAL_MARKERS: tuple[str, ...] = (
         "You are a tool-calling assistant",
         "Available tools",
@@ -565,6 +765,56 @@ class MessageExtractor:
     def _is_windsurf_contextual(cls, text: str) -> bool:
         head = text[:200]
         return any(m in head for m in cls._WINDSURF_CONTEXTUAL_MARKERS)
+
+    @staticmethod
+    def _block_thinking(blocks: object, kinds: tuple[str, ...] = ("thinking",)) -> str | None:
+        """Thinking text from content blocks. Several blocks are separate thoughts, joined by blank lines."""
+        items = as_list(blocks) or []
+        texts = [str(b.get("thinking") or b.get("text") or "") for b in items if isinstance(b, dict) and b.get("type") in kinds]
+        return "\n\n".join(t for t in texts if t) or None
+
+    @staticmethod
+    def _block_tool_calls(blocks: object, kinds: tuple[str, ...] = ("tool_use",)) -> tuple[ToolCall, ...]:
+        """Tool invocations from content blocks. Pi uses ``toolCall`` with ``arguments``, Claude and
+        Factory use ``tool_use`` with ``input``."""
+        calls: list[ToolCall] = []
+        for block in as_list(blocks) or []:
+            if not isinstance(block, dict) or block.get("type") not in kinds:
+                continue
+            arguments = block.get("arguments", block.get("input"))
+            calls.append(
+                ToolCall(
+                    id=str(block.get("id") or ""),
+                    name=str(block.get("name") or ""),
+                    arguments=arguments if isinstance(arguments, dict) else {},
+                )
+            )
+        return tuple(calls)
+
+    @staticmethod
+    def _result_text(value: object) -> str:
+        """Text of a tool result. It is a string, or a list of text blocks, or other JSON."""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "\n".join(str(b.get("text") or "") for b in value if isinstance(b, dict) and b.get("text"))
+        if value is None:
+            return ""
+        return json.dumps(value, ensure_ascii=False)
+
+    @staticmethod
+    def _with_outputs(messages: list[TextMessage], outputs: dict[str, tuple[str, bool]]) -> list[TextMessage]:
+        """Attach recorded tool results to the tool calls they answer (matched by call id)."""
+        attached: list[TextMessage] = []
+        for message in messages:
+            if message.tool_calls:
+                calls = tuple(
+                    replace(call, output=outputs[call.id][0], is_error=outputs[call.id][1]) if call.id in outputs else call
+                    for call in message.tool_calls
+                )
+                message = replace(message, tool_calls=calls)
+            attached.append(message)
+        return attached
 
     @staticmethod
     def _content_text(value: object) -> str:
@@ -651,9 +901,18 @@ class PiRecordBuilder:
                 parent_id = record_id
                 continue
             message_tokens = estimator.count(message.text)
+            content: list[JsonObject] = []
+            if message.thinking:
+                # Same block shape Pi writes for its own reasoning (thinking + thinkingSignature).
+                content.append({"type": "thinking", "thinking": message.thinking, "thinkingSignature": "reasoning_content"})
+            if message.text:
+                content.append({"type": "text", "text": message.text})
+            # Pi's own shape for a tool invocation inside an assistant message.
+            for call in message.tool_calls:
+                content.append({"type": "toolCall", "id": call.id, "name": call.name, "arguments": call.arguments})
             message_payload: JsonObject = {
                 "role": message.role,
-                "content": [{"type": "text", "text": message.text}],
+                "content": content,
                 "timestamp": self._epoch_ms(message.timestamp),
             }
             if message.role == "assistant":
@@ -661,7 +920,7 @@ class PiRecordBuilder:
                 message_payload["provider"] = message.provider or "session-export"
                 message_payload["model"] = message.model or "imported"
                 message_payload["usage"] = self._usage(pending_input_tokens, message_tokens)
-                message_payload["stopReason"] = "stop"
+                message_payload["stopReason"] = "toolUse" if message.tool_calls else "stop"
                 pending_input_tokens = 0
             else:
                 pending_input_tokens += message_tokens
@@ -675,6 +934,26 @@ class PiRecordBuilder:
                 }
             )
             parent_id = record_id
+            # Pi expects one toolResult message per toolCall, right after the assistant message.
+            for call in message.tool_calls:
+                result_id = _next_id()
+                records.append(
+                    {
+                        "type": "message",
+                        "id": result_id,
+                        "parentId": parent_id,
+                        "timestamp": message.timestamp,
+                        "message": {
+                            "role": "toolResult",
+                            "toolCallId": call.id,
+                            "toolName": call.name,
+                            "content": [{"type": "text", "text": call.output if call.output is not None else "(no output recorded)"}],
+                            "isError": call.is_error,
+                            "timestamp": self._epoch_ms(message.timestamp),
+                        },
+                    }
+                )
+                parent_id = result_id
         return records
 
     @staticmethod
@@ -742,18 +1021,46 @@ class CodexRecordBuilder:
                     }
                 )
                 continue
-            content_type = "output_text" if message.role == "assistant" else "input_text"
-            records.append(
-                {
+            if message.thinking and message.role == "assistant":
+                # Codex keeps reasoning as a response item with a summary list.
+                records.append({
+                    "timestamp": message.timestamp,
+                    "type": "response_item",
+                    "payload": {"type": "reasoning", "summary": [{"type": "summary_text", "text": message.thinking}]},
+                })
+            for call in message.tool_calls:
+                records.append({
                     "timestamp": message.timestamp,
                     "type": "response_item",
                     "payload": {
-                        "type": "message",
-                        "role": message.role,
-                        "content": [{"type": content_type, "text": message.text}],
+                        "type": "function_call",
+                        "name": call.name,
+                        "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                        "call_id": call.id,
                     },
-                }
-            )
+                })
+                records.append({
+                    "timestamp": message.timestamp,
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": call.id,
+                        "output": call.output if call.output is not None else "(no output recorded)",
+                    },
+                })
+            content_type = "output_text" if message.role == "assistant" else "input_text"
+            if message.text or not message.tool_calls:
+                records.append(
+                    {
+                        "timestamp": message.timestamp,
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": message.role,
+                            "content": [{"type": content_type, "text": message.text}],
+                        },
+                    }
+                )
         return records
 
 
@@ -844,24 +1151,61 @@ class OpenCodeExportBuilder:
                 continue
             part_id = opencode_id("prt", message.timestamp)
             info = self._message_info(session_id, message_id, parent_id, cwd, message, created)
-            exported.append(
-                {
-                    "info": info,
-                    "parts": [
-                        {
-                            "id": part_id,
-                            "sessionID": session_id,
-                            "messageID": message_id,
-                            "type": "text",
-                            "text": message.text,
-                            "time": {"start": created, "end": created},
-                        }
-                    ],
-                }
-            )
+            parts: list[JsonObject] = []
+            if message.thinking:
+                parts.append(
+                    {
+                        "id": opencode_id("prt", message.timestamp),
+                        "sessionID": session_id,
+                        "messageID": message_id,
+                        "type": "reasoning",
+                        "text": message.thinking,
+                        "time": {"start": created, "end": created},
+                    }
+                )
+            if message.text or not message.tool_calls:
+                parts.append(
+                    {
+                        "id": part_id,
+                        "sessionID": session_id,
+                        "messageID": message_id,
+                        "type": "text",
+                        "text": message.text,
+                        "time": {"start": created, "end": created},
+                    }
+                )
+            for call in message.tool_calls:
+                parts.append(self._tool_part(session_id, message_id, call, created))
+            exported.append({"info": info, "parts": parts})
             if message.role == "user" or index == 0:
                 parent_id = message_id
         return exported
+
+    @staticmethod
+    def _tool_part(session_id: str, message_id: str, call: ToolCall, created: int) -> JsonObject:
+        """OpenCode ``tool`` part. A call with no recorded output is marked completed with a placeholder,
+        so the session does not show it as still running."""
+        span = {"start": created, "end": created}
+        base: JsonObject = {
+            "id": opencode_id("prt", epoch_ms_to_iso(created)),
+            "sessionID": session_id,
+            "messageID": message_id,
+            "type": "tool",
+            "callID": call.id,
+            "tool": call.name,
+        }
+        if call.is_error:
+            state: JsonObject = {"status": "error", "input": call.arguments, "error": call.output or "(failed)", "time": span}
+        else:
+            state = {
+                "status": "completed",
+                "input": call.arguments,
+                "output": call.output if call.output is not None else "(no output recorded)",
+                "title": call.name,
+                "metadata": {},
+                "time": span,
+            }
+        return {**base, "state": state}
 
     @staticmethod
     def _message_info(
@@ -952,12 +1296,20 @@ class ClaudeRecordBuilder:
                 entry_uuid = str(uuid4())
             content = message.text
             if message.role == "assistant":
+                blocks: list[JsonObject] = []
+                if message.thinking:
+                    # Claude Code removes thinking blocks before it sends a request (see ANt in the
+                    # bundle), so an unsigned block is kept for display and never sent back.
+                    blocks.append({"type": "thinking", "thinking": message.thinking, "signature": ""})
+                if message.text:
+                    blocks.append({"type": "text", "text": message.text})
+                blocks.extend({"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments} for call in message.tool_calls)
                 msg_obj: JsonObject = {
                     "role": "assistant",
-                    "content": [{"type": "text", "text": content}],
+                    "content": blocks,
                     "model": message.model or "imported",
                     "usage": {"input_tokens": 0, "output_tokens": 0},
-                    "stop_reason": "end_turn",
+                    "stop_reason": "tool_use" if message.tool_calls else "end_turn",
                 }
             else:
                 msg_obj = {"role": "user", "content": content}
@@ -976,7 +1328,34 @@ class ClaudeRecordBuilder:
                 "version": version,
             })
             parent_uuid = entry_uuid
+            if message.role == "assistant" and message.tool_calls:
+                # Claude Code answers all tool_use blocks of one turn in a single user entry.
+                result_uuid = str(uuid4())
+                records.append({
+                    "type": "user",
+                    "message": {"role": "user", "content": [self._tool_result(call) for call in message.tool_calls]},
+                    "uuid": result_uuid,
+                    "parentUuid": entry_uuid,
+                    "sourceToolAssistantUUID": entry_uuid,
+                    "isSidechain": False,
+                    "userType": "external",
+                    "entrypoint": "cli",
+                    "cwd": cwd,
+                    "sessionId": session_id,
+                    "timestamp": message.timestamp,
+                    "version": version,
+                })
+                parent_uuid = result_uuid
         return records
+
+    @staticmethod
+    def _tool_result(call: ToolCall) -> JsonObject:
+        return {
+            "type": "tool_result",
+            "tool_use_id": call.id,
+            "content": call.output if call.output is not None else "(no output recorded)",
+            "is_error": call.is_error,
+        }
 
 
 def _count_grok_records(session_dir: Path) -> int:
@@ -1047,18 +1426,47 @@ class GrokRecordBuilder:
                 role_chunk = "user_message_chunk"
                 user_count += 1
             msg_timestamp = int(iso_to_epoch_ms(message.timestamp or timestamp) // 1000) or (epoch_base + index + 1)
-            records.append({
-                "timestamp": msg_timestamp,
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": role_chunk,
-                        "messageId": str(uuid4()),
-                        "content": {"type": "text", "text": message.text},
-                    },
-                },
-            })
+            message_id = str(uuid4())
+
+            def envelope(update: JsonObject) -> JsonObject:
+                return {
+                    "timestamp": msg_timestamp,
+                    "method": "session/update",
+                    "params": {"sessionId": session_id, "update": update},
+                }
+
+            if message.thinking and message.role == "assistant":
+                # ACP agent_thought_chunk: the reasoning for this message.
+                records.append(envelope({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "messageId": message_id,
+                    "content": {"type": "text", "text": message.thinking},
+                }))
+            if message.text or not message.tool_calls:
+                records.append(envelope({
+                    "sessionUpdate": role_chunk,
+                    "messageId": message_id,
+                    "content": {"type": "text", "text": message.text},
+                }))
+            for call in message.tool_calls:
+                records.append(envelope({
+                    "sessionUpdate": "tool_call",
+                    "messageId": message_id,
+                    "toolCallId": call.id,
+                    "title": call.name,
+                    "kind": "other",
+                    "status": "pending",
+                    "rawInput": call.arguments,
+                }))
+                output = call.output if call.output is not None else "(no output recorded)"
+                records.append(envelope({
+                    "sessionUpdate": "tool_call_update",
+                    "messageId": message_id,
+                    "toolCallId": call.id,
+                    "status": "failed" if call.is_error else "completed",
+                    "rawOutput": output,
+                    "content": [{"type": "content", "content": {"type": "text", "text": output}}],
+                }))
         records.insert(0, {
             "_summary": {
                 "id": session_id,
@@ -1140,10 +1548,26 @@ class FreebuffRecordBuilder:
             if message.is_compaction:
                 text = "[compaction summary] " + text
             ts_ms = iso_to_epoch_ms(message.timestamp) if message.timestamp else base_ms + seq
+            parts: list[JsonObject] = []
+            if message.thinking and message.role == "assistant":
+                parts.append({"kind": "reasoning", "id": f"reasoning-{seq}", "text": message.thinking, "open": False, "collapse": "preview"})
+            if text or not message.tool_calls:
+                parts.append({"kind": "text", "text": text})
+            for call in message.tool_calls:
+                tool: JsonObject = {
+                    "kind": "tool",
+                    "id": call.id,
+                    "toolName": call.name,
+                    "input": call.arguments,
+                    "status": "failure" if call.is_error else "success",
+                }
+                if call.output is not None:
+                    tool["output"] = call.output
+                parts.append(tool)
             records.append({
                 "seq": seq,
                 "role": "user" if message.role != "assistant" else "assistant",
-                "parts": [{"kind": "text", "text": text}],
+                "parts": parts,
                 "ts": ts_ms,
             })
         return records
@@ -1659,6 +2083,21 @@ class DevinRecordBuilder:
                     "generation_model": message.model or "imported",
                     "telemetry": {"source": "assistant", "operation": "inference"},
                 }
+            if message.role == "assistant" and not message.is_compaction:
+                # ATIF keeps reasoning, tool calls, and their results on the agent step that made them.
+                if message.thinking:
+                    step["reasoning_content"] = message.thinking
+                if message.tool_calls:
+                    step["tool_calls"] = [
+                        {"tool_call_id": call.id, "function_name": call.name, "arguments": call.arguments}
+                        for call in message.tool_calls
+                    ]
+                    step["observation"] = {
+                        "results": [
+                            {"source_call_id": call.id, "content": call.output if call.output is not None else "(no output recorded)"}
+                            for call in message.tool_calls
+                        ]
+                    }
             steps.append(step)
         export: JsonObject = {
             "schema_version": "ATIF-v1.7",
@@ -1991,7 +2430,13 @@ class FactoryRecordBuilder:
                 continue
             if message.is_compaction:
                 continue
-            content: list[JsonObject] = [{"type": "text", "text": message.text}]
+            content: list[JsonObject] = []
+            if message.thinking and message.role == "assistant":
+                # Same block shape as Claude Code, which Factory transcripts follow.
+                content.append({"type": "thinking", "thinking": message.thinking, "signature": ""})
+            if message.text or not message.tool_calls:
+                content.append({"type": "text", "text": message.text})
+            content.extend({"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments} for call in message.tool_calls)
             records.append({
                 "type": "message",
                 "id": str(uuid4()),
@@ -2001,6 +2446,24 @@ class FactoryRecordBuilder:
                     "content": content,
                 },
             })
+            if message.tool_calls:
+                records.append({
+                    "type": "message",
+                    "id": str(uuid4()),
+                    "timestamp": message.timestamp,
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": call.id,
+                                "content": call.output if call.output is not None else "(no output recorded)",
+                                "is_error": call.is_error,
+                            }
+                            for call in message.tool_calls
+                        ],
+                    },
+                })
         return records
 
 
@@ -2437,6 +2900,8 @@ class WindsurfRecordBuilder:
                 variant = b""
                 if message.text:
                     variant += _encode_string_field(1, message.text)
+                if message.thinking:
+                    variant += _encode_string_field(3, message.thinking)
                 step = (
                     _encode_varint_field(1, 14) +
                     _encode_varint_field(4, 3) +
@@ -2452,6 +2917,20 @@ class WindsurfRecordBuilder:
                     _encode_message_field(19, variant)
                 )
             steps_bytes.append(step)
+            # Each tool call is a run_command step (type 21) after the planner step that asked for it.
+            # Its variant (field 28) holds the command (23) and, once it ran, the output (24).
+            for call in message.tool_calls:
+                command = str(call.arguments.get("command") or json.dumps(call.arguments, ensure_ascii=False))
+                run_variant = _encode_string_field(23, command)
+                if call.output is not None:
+                    run_variant += _encode_string_field(24, call.output)
+                run_variant += _encode_string_field(25, command)
+                steps_bytes.append(
+                    _encode_varint_field(1, 21) +
+                    _encode_varint_field(4, 3) +
+                    metadata +
+                    _encode_message_field(28, run_variant)
+                )
 
         # Build CortexTrajectory
         trajectory = _encode_string_field(1, session_id)

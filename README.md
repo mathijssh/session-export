@@ -547,9 +547,10 @@ never the reverse.
 
 UniSessions performs text-history conversions, not full behavioral state
 replay. It preserves user/assistant/system text and enough metadata for the
-target tool to open the session. It does not fully preserve every tool call,
-provider-specific event, approval state, sandbox state, MCP runtime, or
-UI-only event.
+target tool to open the session. Thinking, tool calls, and tool outputs are
+carried across where the target format has a field for them (see
+[Format Support](docs/data-fidelity.md#format-support)). Provider-specific events,
+approval state, sandbox state, MCP runtime, and UI-only events are not preserved.
 
 ### How compaction is handled
 
@@ -616,9 +617,10 @@ overwrite if source changed).
 
 **Does this preserve tool calls and tool outputs?**
 
-No. This tool performs text-history conversions preserving user and assistant
-chat messages, compaction summaries, and session metadata. Tool calls and
-tool outputs are not preserved in the current version.
+Yes, where the target format can hold them. Each tool call keeps its name,
+arguments, output, and error flag, and thinking is kept too. T3 Code writes keep
+text only, and some source tools (for example Windsurf's non-shell steps) are not
+decoded yet. See [Format Support](docs/data-fidelity.md#format-support).
 
 **Can I use the SDK without the CLI?**
 
