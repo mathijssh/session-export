@@ -1135,11 +1135,13 @@ class GrokStore(SessionStore):
     def list(self, *, workers: int = 1) -> list[SessionSummary]:
         paths = self._session_paths()
         if workers <= 1 or len(paths) <= 1:
-            return [s for path in paths if (s := self._cached(self._safe_summary, path)) is not None]
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(workers, len(paths)), thread_name_prefix="grok-list") as executor:
-            results = list(executor.map(lambda p: self._cached(self._safe_summary, p), paths))
-        return [s for s in results if s is not None]
+            summaries = [s for path in paths if (s := self._cached(self._safe_summary, path)) is not None]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(workers, len(paths)), thread_name_prefix="grok-list") as executor:
+                results = list(executor.map(lambda p: self._cached(self._safe_summary, p), paths))
+            summaries = [s for s in results if s is not None]
+        return summaries + self._db_summaries()
 
     def list_metadata(self, *, workers: int = 1) -> list[SessionSummary]:
         return self.list(workers=workers)
@@ -1148,10 +1150,90 @@ class GrokStore(SessionStore):
         path = self._find_path(session_id)
         if path is not None:
             return self._load_file(path)
+        if self._db_session_exists(session_id):
+            return self._load_db_session(session_id)
         raise FileNotFoundError(f"Grok session not found: {session_id}")
 
     def load_path(self, path: Path) -> NativeSession:
+        if path.parent.name == self._DB_NAME:
+            return self._load_db_session(path.name)
         return self._load_file(path)
+
+    # Superagent grok-cli (npm grok-dev) keeps sessions in grok.db next to the Grok Build folders.
+    # Its messages are AI SDK ModelMessage JSON, one row per message, in order.
+    _DB_NAME = "grok.db"
+
+    @property
+    def _grok_db(self) -> Path:
+        return self._grok_home / self._DB_NAME
+
+    def _db_connection(self) -> _sqlite3.Connection:
+        uri = self._grok_db.resolve().as_uri() + "?mode=ro"
+        connection = _sqlite3.connect(uri, uri=True)
+        connection.row_factory = _sqlite3.Row
+        return connection
+
+    def _db_summaries(self) -> list[SessionSummary]:
+        if not self._grok_db.is_file():
+            return []
+        connection = self._db_connection()
+        try:
+            rows = connection.execute(
+                """
+                SELECT s.id, s.cwd_at_start, s.created_at,
+                       (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id AND m.role IN ('user', 'assistant')) AS count
+                FROM sessions s
+                ORDER BY s.created_at
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        return [
+            SessionSummary(
+                provider=self.provider_name,
+                session_id=str(row["id"]),
+                cwd=str(row["cwd_at_start"] or ""),
+                timestamp=str(row["created_at"] or ""),
+                path=self._grok_db / str(row["id"]),
+                message_count=int(row["count"]),
+            )
+            for row in rows
+        ]
+
+    def _db_session_exists(self, session_id: str) -> bool:
+        if not self._grok_db.is_file():
+            return False
+        connection = self._db_connection()
+        try:
+            return connection.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is not None
+        finally:
+            connection.close()
+
+    def _load_db_session(self, session_id: str) -> NativeSession:
+        connection = self._db_connection()
+        try:
+            session = connection.execute(
+                "SELECT id, cwd_at_start, created_at FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if session is None:
+                raise FileNotFoundError(f"Grok session not found: {session_id}")
+            rows = connection.execute(
+                "SELECT role, message_json, created_at FROM messages WHERE session_id = ? ORDER BY seq ASC", (session_id,)
+            ).fetchall()
+        finally:
+            connection.close()
+        records: list[JsonObject] = []
+        for row in rows:
+            message = _json_object(row["message_json"])
+            records.append({**message, "created_at": str(row["created_at"] or "")})
+        return NativeSession(
+            provider=self.provider_name,
+            session_id=str(session["id"]),
+            cwd=str(session["cwd_at_start"] or ""),
+            timestamp=str(session["created_at"] or ""),
+            path=self._grok_db / str(session["id"]),
+            records=records,
+        )
 
     def _find_path(self, session_id: str) -> Path | None:
         index = self._id_index_cache()

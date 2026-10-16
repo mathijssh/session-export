@@ -647,7 +647,77 @@ class MessageExtractor:
                     messages.append(TextMessage("user", text, timestamp, is_contextual=True))
         return messages
 
+    @staticmethod
+    def _typed_text(parts: list[object]) -> str:
+        """Text of ``text`` parts only. ``sequence_to_text`` would also take reasoning text."""
+        texts = [str(part.get("text") or "") for part in parts if isinstance(part, dict) and part.get("type") == "text" and part.get("text")]
+        return "\n".join(texts)
+
+    @staticmethod
+    def _grok_output(output: object) -> tuple[str, bool]:
+        """Tool output in the AI SDK shape used by grok-cli: ``{type: json, value: {success, output, error}}``,
+        ``{type: text | error-text, value}``, or a bare result object."""
+        if isinstance(output, dict) and output.get("type") in ("json", "text", "error-text") and "value" in output:
+            value = output.get("value")
+            if output.get("type") == "error-text":
+                return (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)), True
+            if isinstance(value, dict) and "success" in value:
+                text = value.get("output") if value.get("output") is not None else value.get("error")
+                return (str(text) if text is not None else ""), value.get("success") is not True
+            if isinstance(value, str):
+                return value, False
+            return json.dumps(value, ensure_ascii=False), False
+        if isinstance(output, dict) and "success" in output:
+            text = output.get("output") if output.get("output") is not None else output.get("error")
+            return (str(text) if text is not None else ""), output.get("success") is not True
+        if isinstance(output, str):
+            return output, False
+        return (json.dumps(output, ensure_ascii=False) if output is not None else ""), False
+
+    def _from_grok_messages(self, session: NativeSession) -> list[TextMessage]:
+        """grok-cli messages: AI SDK ModelMessage records. Assistant content holds ``reasoning``, ``text``,
+        and ``tool-call`` parts. Tool results come in later ``tool`` messages, matched by toolCallId."""
+        messages: list[TextMessage] = []
+        outputs: dict[str, tuple[str, bool]] = {}
+        for record in session.records:
+            role = string_value(record, "role") or ""
+            timestamp = string_value(record, "created_at") or session.timestamp
+            content = record.get("content")
+            parts = as_list(content) or []
+            if role == "tool":
+                for part in parts:
+                    obj = as_object(part)
+                    if obj is not None and obj.get("type") == "tool-result":
+                        outputs[string_value(obj, "toolCallId") or ""] = self._grok_output(obj.get("output"))
+                continue
+            if role == "user":
+                text = content if isinstance(content, str) else self._typed_text(parts)
+                if text:
+                    messages.append(TextMessage("user", text, timestamp, is_contextual=self._is_contextual(text)))
+                continue
+            if role != "assistant":
+                continue
+            text = content if isinstance(content, str) else self._typed_text(parts)
+            thinking = self._block_thinking(parts, ("reasoning",))
+            calls: list[ToolCall] = []
+            for part in parts:
+                obj = as_object(part)
+                if obj is None or obj.get("type") != "tool-call":
+                    continue
+                arguments = as_object(obj.get("input")) or {}
+                calls.append(ToolCall(id=string_value(obj, "toolCallId") or "", name=string_value(obj, "toolName") or "", arguments=arguments))
+            if not text and not thinking and not calls:
+                continue
+            messages.append(TextMessage("assistant", text, timestamp, provider="grok", thinking=thinking, tool_calls=tuple(calls)))
+        return self._with_outputs(messages, outputs)
+
     def from_grok(self, session: NativeSession) -> list[TextMessage]:
+        """Extract text history from a Grok session (Grok Build or grok-cli)."""
+        if any(isinstance(record, dict) and "role" in record for record in session.records):
+            return self._from_grok_messages(session)
+        return self._from_grok_envelopes(session)
+
+    def _from_grok_envelopes(self, session: NativeSession) -> list[TextMessage]:
         """Extract text history from a Grok Build session.
 
         Grok stores sessions as ``updates.jsonl``: one ACP session update envelope per line,
