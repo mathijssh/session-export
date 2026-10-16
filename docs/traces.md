@@ -22,26 +22,32 @@ Spec: <https://huggingface.co/docs/hub/session-traces-format>
 
 ### 2. OpenAI Fine-tuning Format
 
-Standard `{"messages": [{"role": ..., "content": ...}]}` JSONL, one
-conversation per line. Compatible with OpenAI, Azure OpenAI, and
-HuggingFace TRL fine-tuning pipelines.
+Standard `{"messages": [...]}` JSONL, one conversation per line. Compatible with
+OpenAI, Azure OpenAI, and HuggingFace TRL fine-tuning pipelines. An assistant turn
+that called tools carries `tool_calls`, and each result follows as a `role: tool`
+message with the matching `tool_call_id`. Reasoning is a `<think>...</think>` block
+at the start of the assistant content.
 
 ```jsonl
-{"messages":[{"role":"user","content":"Fix the bug"},{"role":"assistant","content":"Looking at it"}]}
+{"messages":[{"role":"user","content":"Fix the bug"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{\"command\": \"ls\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"a.txt"},{"role":"assistant","content":"Looking at it"}]}
 ```
 
 Spec: <https://platform.openai.com/docs/guides/fine-tuning>
 
 ### 3. ShareGPT Format
 
-Community standard `{"conversations": [{"from": ..., "value": ...}]}` JSONL.
-Used by LLaMA-Factory, Axolotl, torchtune, and many open-source training
-frameworks. Role mapping: `user` -> `human`, `assistant` -> `gpt`,
-`system` -> `system`, `tool` -> `tool`.
+Community standard `{"conversations": [{"from": ..., "value": ...}]}` JSONL, the
+form LLaMA-Factory reads. Role mapping: `user` -> `human`, `assistant` -> `gpt`,
+`system` -> `system`. Each tool call is a `function_call` turn (JSON with `name` and
+`arguments`), and each result is an `observation` turn. LLaMA-Factory expects human and
+observation turns at odd positions and gpt and function_call turns at even positions.
 
 ```jsonl
-{"conversations":[{"from":"human","value":"Fix the bug"},{"from":"gpt","value":"Looking at it"}]}
+{"conversations":[{"from":"human","value":"Fix the bug"},{"from":"function_call","value":"{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}"},{"from":"observation","value":"a.txt"},{"from":"gpt","value":"Looking at it"}]}
 ```
+
+Leave tool calls or reasoning out with `--no-tool-calls` or `--no-thinking`. See
+[Options](../README.md#options-tool-calls-and-thinking).
 
 ## CLI Usage
 
