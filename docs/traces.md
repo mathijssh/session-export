@@ -47,7 +47,7 @@ observation turns at odd positions and gpt and function_call turns at even posit
 ```
 
 Leave tool calls or reasoning out with `--no-tool-calls` or `--no-thinking`. See
-[Options](../README.md#options-tool-calls-and-thinking).
+[Options](https://github.com/vibheksoni/session-export/blob/main/README.md#options-tool-calls-and-thinking).
 
 ## CLI Usage
 
