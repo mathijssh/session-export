@@ -1544,12 +1544,11 @@ def _count_freebuff_records(db_path: Path) -> int:
 
 
 class GrokRecordBuilder:
-    """Build Grok Build session records: ACP update envelopes + summary.
+    """Build a grok-cli session (superagent-ai/grok-cli ``grok.db``) from a TextMessage stream.
 
-    Each message becomes one ``session/update`` envelope with a full-text
-    ``ContentChunk`` (no chunk splitting needed for import).  A leading
-    ``{"_summary": {...}}`` marker record carries the flattened summary
-    metadata that ``GrokStore.write`` turns into ``summary.json``.
+    Records: a leading ``{"_session": {...}}`` header, then one AI SDK ``ModelMessage`` per turn with a
+    ``created_at`` key. Tool results are their own ``tool`` message, as grok-cli stores them.
+    ``GrokStore.write`` inserts the records into the database.
     """
 
     def build(
@@ -1559,86 +1558,55 @@ class GrokRecordBuilder:
         timestamp: str,
         messages: list[TextMessage],
         model_id: str = "grok-4.6",
-        agent_name: str = "general-purpose",
     ) -> list[JsonObject]:
-        from session_sdk.paths import iso_to_epoch_ms
-        from uuid import uuid4
+        from session_sdk.paths import epoch_ms_to_iso, iso_to_epoch_ms
 
-        epoch_base = iso_to_epoch_ms(timestamp) // 1000 if timestamp else 0
+        base = timestamp or ""
         records: list[JsonObject] = []
-        user_count = 0
-        assistant_count = 0
-        for index, message in enumerate(messages):
+        title = ""
+        first_created = ""
+        last_created = ""
+        for message in messages:
             if message.is_contextual:
                 continue
-            if message.is_compaction:
-                # Compaction summaries import as user messages so the
-                # conversation stays readable in Grok's TUI.
-                role_chunk = "user_message_chunk"
-                user_count += 1
-            elif message.role == "assistant":
-                role_chunk = "agent_message_chunk"
-                assistant_count += 1
-            else:
-                role_chunk = "user_message_chunk"
-                user_count += 1
-            msg_timestamp = int(iso_to_epoch_ms(message.timestamp or timestamp) // 1000) or (epoch_base + index + 1)
-            message_id = str(uuid4())
-
-            def envelope(update: JsonObject) -> JsonObject:
-                return {
-                    "timestamp": msg_timestamp,
-                    "method": "session/update",
-                    "params": {"sessionId": session_id, "update": update},
-                }
-
-            if message.thinking and message.role == "assistant":
-                # ACP agent_thought_chunk: the reasoning for this message.
-                records.append(envelope({
-                    "sessionUpdate": "agent_thought_chunk",
-                    "messageId": message_id,
-                    "content": {"type": "text", "text": message.thinking},
-                }))
-            if message.text or not (message.tool_calls or message.thinking):
-                records.append(envelope({
-                    "sessionUpdate": role_chunk,
-                    "messageId": message_id,
-                    "content": {"type": "text", "text": message.text},
-                }))
+            if message.role not in ("user", "assistant") and not message.is_compaction:
+                continue
+            if not (message.text.strip() or message.thinking or message.tool_calls):
+                continue
+            created = epoch_ms_to_iso(iso_to_epoch_ms(message.timestamp or base)) if (message.timestamp or base) else ""
+            first_created = first_created or created
+            last_created = created or last_created
+            if message.is_compaction or message.role == "user":
+                if not title and message.role == "user" and not message.is_compaction:
+                    title = message.text.strip().splitlines()[0][:80] if message.text.strip() else ""
+                records.append({"role": "user", "content": message.text, "created_at": created})
+                continue
+            parts: list[JsonObject] = []
+            if message.thinking:
+                parts.append({"type": "reasoning", "text": message.thinking})
+            if message.text:
+                parts.append({"type": "text", "text": message.text})
             for call in message.tool_calls:
-                records.append(envelope({
-                    "sessionUpdate": "tool_call",
-                    "messageId": message_id,
-                    "toolCallId": call.id,
-                    "title": call.name,
-                    "kind": "other",
-                    "status": "pending",
-                    "rawInput": call.arguments,
-                }))
-                output = call.output if call.output is not None else "(no output recorded)"
-                records.append(envelope({
-                    "sessionUpdate": "tool_call_update",
-                    "messageId": message_id,
-                    "toolCallId": call.id,
-                    "status": "failed" if call.is_error else "completed",
-                    "rawOutput": output,
-                    "content": [{"type": "content", "content": {"type": "text", "text": output}}],
-                }))
-        records.insert(0, {
-            "_summary": {
-                "id": session_id,
-                "cwd": cwd,
-                "title": "",
-                "created_at": timestamp,
-                "updated_at": timestamp,
-                "num_messages": user_count + assistant_count,
-                "num_chat_messages": user_count + assistant_count,
-                "current_model_id": model_id,
-                "parent_session_id": "",
-                "agent_name": agent_name,
-            }
-        })
-        return records
+                parts.append({"type": "tool-call", "toolCallId": call.id, "toolName": call.name, "input": call.arguments})
+            records.append({"role": "assistant", "content": parts, "created_at": created})
+            if message.tool_calls:
+                results: list[JsonObject] = []
+                for call in message.tool_calls:
+                    text = call.output if call.output is not None else "(no output recorded)"
+                    value: JsonObject = {"success": not call.is_error, "output": text}
+                    if call.is_error:
+                        value["error"] = text
+                    results.append({"type": "tool-result", "toolCallId": call.id, "toolName": call.name, "output": {"type": "json", "value": value}})
+                records.append({"role": "tool", "content": results, "created_at": created})
+        header: JsonObject = {
+            "id": session_id,
+            "cwd": cwd,
+            "title": title or "Imported session",
+            "model": model_id,
+            "created_at": first_created or last_created,
+            "updated_at": last_created or first_created,
+        }
+        return [{"_session": header}, *records]
 
 
 class FreebuffRecordBuilder:

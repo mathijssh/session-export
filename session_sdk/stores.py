@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 try:
@@ -1245,46 +1247,15 @@ class GrokStore(SessionStore):
         return None
 
     def destination_path(self, session_id: str, cwd: str) -> Path:
-        group = encode_grok_cwd_dirname(cwd)
-        return self._active_session_root() / group / session_id
+        """A grok-cli session is a row in ``grok.db``. Its path is the virtual ``grok.db/<session id>``."""
+        return self._grok_db / session_id
 
     def write(self, path: Path, records: list[JsonObject], *, overwrite: bool = False) -> None:
-        """Write a Grok session directory: updates.jsonl + summary.json.
-
-        ``records`` must be list of envelope dicts (already shaped as
-        ``{"timestamp", "method", "params"}``); the builder produces them.
-        A ``summary.json`` is derived from the first envelope's session id
-        plus any ``{"_summary": {...}}`` metadata record the builder emits.
-        """
-        session_dir = Path(path)
-        updates_file = session_dir / "updates.jsonl"
-        if updates_file.exists() and not overwrite:
-            raise FileExistsError(f"destination exists: {updates_file}")
-        session_dir.mkdir(parents=True, exist_ok=True)
-
-        summary: dict[str, object] = {}
-        envelopes: list[JsonObject] = []
-        for record in records:
-            if isinstance(record, dict) and "_summary" in record:
-                summary = dict(as_object(record.get("_summary")) or {})
-            else:
-                envelopes.append(record)
-        if not summary:
-            summary = _derive_grok_summary(envelopes, session_dir)
-
-        JsonlFile(updates_file).write(envelopes, overwrite=True)
-        summary_path = session_dir / "summary.json"
-        if summary_path.exists() and not overwrite:
-            raise FileExistsError(f"destination exists: {summary_path}")
-        summary_path.write_text(_json_dumps_pretty(summary), encoding="utf-8")
-        # Long-path groups record the original cwd so decode is reversible.
-        group_dir = session_dir.parent
-        if group_dir.name != encode_grok_cwd_dirname(str(summary.get("cwd") or "")):
-            cwd_file = group_dir / ".cwd"
-            if not cwd_file.exists():
-                cwd = summary.get("cwd")
-                if cwd:
-                    cwd_file.write_text(str(cwd), encoding="utf-8")
+        """Insert one session into ``grok.db``, the store grok-cli reads. ``records`` come from
+        ``GrokRecordBuilder``. An existing session is replaced only when ``overwrite`` is set."""
+        if path.parent.name != self._DB_NAME:
+            raise ValueError(f"Grok sessions are written to {self._DB_NAME}, not {path}")
+        _write_grok_session(path.parent, path.name, records, overwrite=overwrite)
 
     def _session_paths(self) -> list[Path]:
         if self._path_cache is not None:
@@ -2435,3 +2406,168 @@ def _t3_record(role: object, text: object, created_at: object, thread: _T3Thread
         "instance_id": thread.instance_id,
         "model": thread.model,
     }
+
+
+# grok-cli schema (superagent-ai/grok-cli src/storage/migrations.ts, user_version 3).
+_GROK_CLI_SCHEMA = Path(__file__).resolve().parent / "data" / "grok_cli.sql"
+_GROK_CLI_USER_VERSION = 3
+
+
+def destination_exists(path: Path) -> bool:
+    """Whether a conversion destination already holds its session. Grok sessions are rows, so their
+    virtual ``grok.db/<id>`` path never exists as a file. Everything else is a plain path check."""
+    if path.parent.name == GrokStore._DB_NAME:
+        return grok_db_has_session(path.parent, path.name)
+    return path.exists()
+
+
+def grok_db_has_session(database: Path, session_id: str) -> bool:
+    if not database.is_file():
+        return False
+    connection = _sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        return connection.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is not None
+    finally:
+        connection.close()
+
+
+def _write_grok_session(database: Path, session_id: str, records: list[JsonObject], *, overwrite: bool) -> None:
+    if not records or "_session" not in records[0]:
+        raise ValueError("grok session records must start with a _session header")
+    header = as_object(records[0].get("_session")) or {}
+    created_default = string_value(header, "created_at") or _grok_now()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    connection = _sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(_GROK_CLI_SCHEMA.read_text(encoding="utf-8"))
+        if connection.execute("PRAGMA user_version").fetchone()[0] == 0:
+            connection.execute(f"PRAGMA user_version = {_GROK_CLI_USER_VERSION}")
+        with connection:
+            if connection.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is not None:
+                if not overwrite:
+                    raise FileExistsError(f"grok session already exists: {session_id}")
+                connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            cwd = string_value(header, "cwd") or ""
+            workspace_id = _ensure_grok_workspace(connection, cwd)
+            connection.execute(
+                """
+                INSERT INTO sessions (
+                    id, workspace_id, title, recap_text, recap_model, recap_updated_at, model, mode, cwd_at_start, cwd_last, status, created_at, updated_at
+                ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, 'agent', ?, ?, 'active', ?, ?)
+                """,
+                (
+                    session_id,
+                    workspace_id,
+                    string_value(header, "title") or "Imported session",
+                    string_value(header, "model") or "grok-4.6",
+                    cwd,
+                    cwd,
+                    created_default,
+                    created_default,
+                ),
+            )
+            last_created = created_default
+            for seq, record in enumerate(records[1:], start=1):
+                role = string_value(record, "role") or ""
+                created = string_value(record, "created_at") or created_default
+                last_created = created
+                message = {key: value for key, value in record.items() if key != "created_at"}
+                connection.execute(
+                    "INSERT INTO messages (session_id, seq, role, message_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (session_id, seq, role, json.dumps(message, ensure_ascii=False), created),
+                )
+                content = as_list(record.get("content")) or []
+                if role == "assistant":
+                    for part in content:
+                        call = as_object(part) or {}
+                        if call.get("type") != "tool-call":
+                            continue
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO tool_calls (
+                                session_id, message_seq, tool_call_id, tool_name, args_json, status, started_at, completed_at
+                            ) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?)
+                            """,
+                            (
+                                session_id,
+                                seq,
+                                string_value(call, "toolCallId") or "",
+                                string_value(call, "toolName") or "",
+                                json.dumps(call.get("input") or {}, ensure_ascii=False),
+                                created,
+                                created,
+                            ),
+                        )
+                if role == "tool":
+                    for part in content:
+                        result = as_object(part) or {}
+                        if result.get("type") != "tool-result":
+                            continue
+                        call_id = string_value(result, "toolCallId") or ""
+                        row = connection.execute(
+                            "SELECT id FROM tool_calls WHERE session_id = ? AND tool_call_id = ?", (session_id, call_id)
+                        ).fetchone()
+                        if row is None:
+                            connection.execute(
+                                """
+                                INSERT INTO tool_calls (
+                                    session_id, message_seq, tool_call_id, tool_name, args_json, status, started_at, completed_at
+                                ) VALUES (?, ?, ?, ?, '{}', 'completed', ?, ?)
+                                """,
+                                (session_id, seq, call_id, string_value(result, "toolName") or "", created, created),
+                            )
+                            row = connection.execute(
+                                "SELECT id FROM tool_calls WHERE session_id = ? AND tool_call_id = ?", (session_id, call_id)
+                            ).fetchone()
+                        output = as_object(result.get("output")) or {}
+                        value = as_object(output.get("value"))
+                        extracted = value if value is not None else output
+                        success = extracted.get("success") is not False
+                        connection.execute(
+                            "INSERT INTO tool_results (tool_call_row_id, output_kind, output_json, success, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (
+                                row[0],
+                                string_value(output, "type") or "json",
+                                json.dumps(extracted, ensure_ascii=False),
+                                1 if success else 0,
+                                created,
+                            ),
+                        )
+            connection.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (last_created, session_id))
+    finally:
+        connection.close()
+
+
+def _ensure_grok_workspace(connection: _sqlite3.Connection, cwd: str) -> str:
+    """The workspace row grok-cli uses: scope is the git root (or the directory), id is a SHA-1 prefix of the scope."""
+    canonical = os.path.realpath(cwd or str(Path.home()))
+    git_root = _grok_git_root(canonical)
+    scope = git_root or canonical
+    display = os.path.basename(scope.rstrip("\\/")) or "workspace"
+    connection.execute(
+        """
+        INSERT INTO workspaces (id, scope_key, canonical_path, git_root, display_name, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scope_key) DO UPDATE SET
+            canonical_path = excluded.canonical_path,
+            git_root = excluded.git_root,
+            display_name = excluded.display_name,
+            last_seen_at = excluded.last_seen_at
+        """,
+        (hashlib.sha1(scope.encode("utf-8")).hexdigest()[:16], scope, canonical, git_root, display, _grok_now()),
+    )
+    row = connection.execute("SELECT id FROM workspaces WHERE scope_key = ?", (scope,)).fetchone()
+    return str(row[0])
+
+
+def _grok_git_root(path: str) -> str | None:
+    current = Path(path)
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return str(candidate)
+    return None
+
+
+def _grok_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")

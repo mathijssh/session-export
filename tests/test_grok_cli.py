@@ -108,5 +108,86 @@ class GrokCliStoreTests(unittest.TestCase):
         self.assertEqual([m.text for m in messages], ["hi"])
 
 
+class GrokCliWriteTests(unittest.TestCase):
+    """Writing the grok target: rows in grok.db in the layout grok-cli reads."""
+
+    def _messages(self) -> list:
+        from session_sdk.models import TextMessage, ToolCall
+        return [
+            TextMessage("user", "List the files", "2026-06-01T10:00:00.000Z"),
+            TextMessage(
+                "assistant",
+                "Here they are.",
+                "2026-06-01T10:00:05.000Z",
+                thinking="Run ls first.",
+                tool_calls=(
+                    ToolCall(id="tc-1", name="bash", arguments={"command": "ls"}, output="a.txt"),
+                    ToolCall(id="tc-2", name="read_file", arguments={"path": "b.txt"}, output="missing", is_error=True),
+                ),
+            ),
+        ]
+
+    def _write(self, home: Path, *, overwrite: bool = False) -> GrokStore:
+        from session_sdk.converters import GrokRecordBuilder
+        from session_sdk.stores import destination_exists
+        store = GrokStore(home)
+        records = GrokRecordBuilder().build("write-1", r"C:\work\demo", "2026-06-01T10:00:00.000Z", self._messages())
+        destination = store.destination_path("write-1", r"C:\work\demo")
+        store.write(destination, records, overwrite=overwrite)
+        self.assertTrue(destination_exists(destination))
+        return store
+
+    def test_written_session_reads_back_with_thinking_and_tools(self) -> None:
+        from session_sdk.converters import MessageExtractor
+        with tempfile.TemporaryDirectory() as root:
+            store = self._write(Path(root) / ".grok")
+            messages = MessageExtractor().from_grok(store.load("write-1"))
+            self.assertEqual([m.role for m in messages], ["user", "assistant"])
+            assistant = messages[1]
+            self.assertEqual(assistant.text, "Here they are.")
+            self.assertEqual(assistant.thinking, "Run ls first.")
+            self.assertEqual([(c.id, c.name) for c in assistant.tool_calls], [("tc-1", "bash"), ("tc-2", "read_file")])
+            self.assertEqual((assistant.tool_calls[0].output, assistant.tool_calls[0].is_error), ("a.txt", False))
+            self.assertEqual((assistant.tool_calls[1].output, assistant.tool_calls[1].is_error), ("missing", True))
+
+    def test_rows_match_grok_cli_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root) / ".grok"
+            self._write(home)
+            connection = sqlite3.connect(home / "grok.db")
+            try:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+                session = connection.execute("SELECT workspace_id, model, mode, status, cwd_at_start FROM sessions WHERE id = 'write-1'").fetchone()
+                self.assertEqual(session[1:], ("grok-4.6", "agent", "active", r"C:\work\demo"))
+                scope = r"C:\work\demo"
+                expected_workspace = __import__("hashlib").sha1(scope.encode("utf-8")).hexdigest()[:16]
+                self.assertEqual(session[0], expected_workspace)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM messages WHERE session_id = 'write-1'").fetchone()[0], 3)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM tool_calls WHERE session_id = 'write-1'").fetchone()[0], 2)
+                success = dict(connection.execute(
+                    "SELECT tc.tool_call_id, tr.success FROM tool_results tr JOIN tool_calls tc ON tc.id = tr.tool_call_row_id WHERE tc.session_id = 'write-1'"
+                ).fetchall())
+                self.assertEqual(success, {"tc-1": 1, "tc-2": 0})
+            finally:
+                connection.close()
+
+    def test_existing_session_needs_overwrite(self) -> None:
+        from session_sdk.converters import GrokRecordBuilder
+        with tempfile.TemporaryDirectory() as root:
+            store = self._write(Path(root) / ".grok")
+            records = GrokRecordBuilder().build("write-1", r"C:\work\demo", "2026-06-01T10:00:00.000Z", self._messages())
+            with self.assertRaises(FileExistsError):
+                store.write(store.destination_path("write-1", r"C:\work\demo"), records, overwrite=False)
+            store.write(store.destination_path("write-1", r"C:\work\demo"), records, overwrite=True)
+            self.assertEqual(len(store.load("write-1").records), 3)  # replaced, not appended
+
+    def test_refuses_paths_outside_grok_db(self) -> None:
+        from session_sdk.converters import GrokRecordBuilder
+        with tempfile.TemporaryDirectory() as root:
+            store = GrokStore(Path(root) / ".grok")
+            with self.assertRaises(ValueError):
+                store.write(Path(root) / "elsewhere" / "write-1", GrokRecordBuilder().build("write-1", "", "", self._messages()))
+
+
 if __name__ == "__main__":
     unittest.main()

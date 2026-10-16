@@ -89,7 +89,7 @@ Assistant reasoning is carried into the thinking field of each assistant message
 | Devin | yes / yes (`reasoning_content`) | yes / yes (`tool_calls`, `observation`) |
 | Factory | yes / yes (`thinking` block, from the Droid schema) | yes / yes (`tool_use`, `tool_result`) |
 | Windsurf | planner thinking / yes (field 3) | `run_command`, grep, view file, list directory, find files, and MCP calls, with outputs from the command-result steps / `run_command` only |
-| Grok Build | yes / yes (ACP `agent_thought_chunk`) | ACP `tool_call` and `tool_call_update` / yes (not verified against local Grok data) |
+| Grok (grok-cli `grok.db`, and Grok Build folders) | yes / yes (`reasoning` part; read from Grok Build folders too) | yes / yes (`tool-call` and `tool-result` parts, read from Grok Build ACP `tool_call` updates) |
 | Freebuff | yes / yes (`reasoning` part) | yes / yes (`tool` part) |
 | T3 Code | no / no (text only) | no / no (text only) |
 

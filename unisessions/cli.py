@@ -91,7 +91,7 @@ from session_sdk.converters import (
 )
 from session_sdk.models import ConversionPlan, SessionSummary
 from session_sdk.paths import SessionIdFactory, WindowsDefaults
-from session_sdk.stores import T3_PROVIDER_DRIVERS, T3WriteError, ClaudeStore, CodexStore, DevinStore, FactoryStore, FreebuffStore, GrokStore, OpenCodeStore, PiDcpStore, PiStore, T3Store, WindsurfStore
+from session_sdk.stores import T3_PROVIDER_DRIVERS, T3WriteError, destination_exists, ClaudeStore, CodexStore, DevinStore, FactoryStore, FreebuffStore, GrokStore, OpenCodeStore, PiDcpStore, PiStore, T3Store, WindsurfStore
 from session_sdk.traces import TRACE_FORMATS, build_trace
 from session_sdk.converters import MessageExtractor
 
@@ -851,7 +851,7 @@ class CliApp:
         taken = getattr(converter, "destination_taken", None)
         if taken is not None:
             return bool(taken(plan))
-        return plan.destination.exists()
+        return destination_exists(plan.destination)
 
     def _resolve_conflict(self, args: argparse.Namespace, converter, session_id: str) -> str:
         """Returns 'skip', 'overwrite', or 'fork'."""

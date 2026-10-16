@@ -1202,8 +1202,6 @@ class GrokTests(unittest.TestCase):
             grok_home = root / ".grok"
             from session_sdk.stores import GrokStore, PiStore, PiDcpStore
             from session_sdk.converters import PiToGrokConverter, PiRecordBuilder
-            from session_sdk.paths import encode_grok_cwd_dirname
-
             pi_store = PiStore(root / ".pi" / "agent")
             dcp_store = PiDcpStore(root / ".pi-dcp")
             builder = PiRecordBuilder()
@@ -1223,7 +1221,7 @@ class GrokTests(unittest.TestCase):
             converter = PiToGrokConverter(pi_store, grok_store, SessionIdFactory(preserve_ids=True))
             plan = converter.plan("pi-src-001")
             self.assertEqual(plan.destination.name, "pi-src-001")
-            self.assertEqual(plan.destination.parent.name, encode_grok_cwd_dirname(r"C:\test\project"))
+            self.assertEqual(plan.destination.parent.name, "grok.db")  # grok-cli keeps sessions as rows
             converter.write(plan, overwrite=True)
 
             session = grok_store.load("pi-src-001")
